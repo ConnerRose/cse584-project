@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.bc
+
+# PostgreSQL PGXS
+results/
+regression.diffs
+regression.out
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+.clangd
