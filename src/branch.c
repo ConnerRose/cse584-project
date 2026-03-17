@@ -144,6 +144,218 @@ Datum branch_switch(PG_FUNCTION_ARGS) {
 }
 
 /* ----------------------------------------------------------------
+ * branch_apply(branch_name TEXT)
+ *
+ * Replays the delta log for the given branch into the base table,
+ * applying inserts, deletes, and updates in _seq order, then
+ * truncates the delta table.
+ * ----------------------------------------------------------------
+ */
+PG_FUNCTION_INFO_V1(branch_apply);
+
+Datum branch_apply(PG_FUNCTION_ARGS) {
+  text* branch_name_t = PG_GETARG_TEXT_PP(0);
+  char* branch_name = text_to_cstring(branch_name_t);
+
+  int ret;
+  StringInfoData buf;
+  char* base_table;
+  char* delta_table;
+
+  SPI_connect();
+
+  /* Look up branch metadata */
+  initStringInfo(&buf);
+  appendStringInfo(
+      &buf,
+      "SELECT base_table, delta_table FROM branch.branches WHERE name = %s",
+      quote_literal_cstr(branch_name));
+
+  ret = SPI_execute(buf.data, true, 1);
+
+  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+    ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+                    errmsg("branch \"%s\" does not exist", branch_name)));
+  }
+
+  base_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+  delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+
+  if (delta_table == NULL) {
+    ereport(ERROR,
+            (errmsg("branch \"%s\" has no delta table (is it main?)", branch_name)));
+  }
+
+  /* Get column names from the base table (excluding delta metadata cols) */
+  resetStringInfo(&buf);
+  appendStringInfo(
+      &buf,
+      "SELECT string_agg(column_name, ', ') "
+      "FROM information_schema.columns "
+      "WHERE table_name = %s AND table_schema = 'public'",
+      quote_literal_cstr(base_table));
+
+  ret = SPI_execute(buf.data, true, 1);
+  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+    ereport(ERROR, (errmsg("could not read columns for table \"%s\"", base_table)));
+  }
+
+  {
+    char* columns =
+        SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+    /* Get the primary key column name */
+    resetStringInfo(&buf);
+    appendStringInfo(
+        &buf,
+        "SELECT a.attname FROM pg_index i "
+        "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "AND a.attnum = ANY(i.indkey) "
+        "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+        quote_literal_cstr(base_table));
+
+    ret = SPI_execute(buf.data, true, 1);
+    if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+      ereport(ERROR,
+              (errmsg("could not determine primary key for \"%s\"", base_table)));
+    }
+
+    {
+      char* pk_col =
+          SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+      /* Apply inserts */
+      resetStringInfo(&buf);
+      appendStringInfo(&buf,
+                       "INSERT INTO %s (%s) "
+                       "SELECT %s FROM branch.%s "
+                       "WHERE _op = 'I' ORDER BY _seq",
+                       quote_identifier(base_table), columns, columns,
+                       quote_identifier(delta_table));
+
+      ret = SPI_execute(buf.data, false, 0);
+      if (ret != SPI_OK_INSERT) {
+        ereport(ERROR, (errmsg("failed to apply inserts for branch \"%s\"",
+                               branch_name)));
+      }
+
+      /* Apply deletes */
+      resetStringInfo(&buf);
+      appendStringInfo(&buf,
+                       "DELETE FROM %s WHERE %s IN "
+                       "(SELECT %s FROM branch.%s WHERE _op = 'D')",
+                       quote_identifier(base_table), quote_identifier(pk_col),
+                       quote_identifier(pk_col), quote_identifier(delta_table));
+
+      ret = SPI_execute(buf.data, false, 0);
+      if (ret != SPI_OK_DELETE) {
+        ereport(ERROR, (errmsg("failed to apply deletes for branch \"%s\"",
+                               branch_name)));
+      }
+
+      /* Apply updates: delete old rows then insert updated rows */
+      resetStringInfo(&buf);
+      appendStringInfo(&buf,
+                       "DELETE FROM %s WHERE %s IN "
+                       "(SELECT %s FROM branch.%s WHERE _op = 'U')",
+                       quote_identifier(base_table), quote_identifier(pk_col),
+                       quote_identifier(pk_col), quote_identifier(delta_table));
+
+      ret = SPI_execute(buf.data, false, 0);
+      if (ret != SPI_OK_DELETE) {
+        ereport(ERROR, (errmsg("failed to apply updates (delete phase) for "
+                               "branch \"%s\"",
+                               branch_name)));
+      }
+
+      resetStringInfo(&buf);
+      appendStringInfo(&buf,
+                       "INSERT INTO %s (%s) "
+                       "SELECT %s FROM branch.%s "
+                       "WHERE _op = 'U' ORDER BY _seq",
+                       quote_identifier(base_table), columns, columns,
+                       quote_identifier(delta_table));
+
+      ret = SPI_execute(buf.data, false, 0);
+      if (ret != SPI_OK_INSERT) {
+        ereport(ERROR, (errmsg("failed to apply updates (insert phase) for "
+                               "branch \"%s\"",
+                               branch_name)));
+      }
+    }
+  }
+
+  /* Truncate the delta table */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf, "TRUNCATE branch.%s", quote_identifier(delta_table));
+
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UTILITY) {
+    ereport(ERROR,
+            (errmsg("failed to truncate delta table for branch \"%s\"", branch_name)));
+  }
+
+  SPI_finish();
+
+  elog(NOTICE, "applied and cleared delta log for branch \"%s\"", branch_name);
+  PG_RETURN_VOID();
+}
+
+/* ----------------------------------------------------------------
+ * branch_rollback(branch_name TEXT)
+ *
+ * Discards all changes in the branch's delta table by truncating it.
+ * ----------------------------------------------------------------
+ */
+PG_FUNCTION_INFO_V1(branch_rollback);
+
+Datum branch_rollback(PG_FUNCTION_ARGS) {
+  text* branch_name_t = PG_GETARG_TEXT_PP(0);
+  char* branch_name = text_to_cstring(branch_name_t);
+
+  int ret;
+  StringInfoData buf;
+  char* delta_table;
+
+  SPI_connect();
+
+  /* Look up the delta table */
+  initStringInfo(&buf);
+  appendStringInfo(
+      &buf, "SELECT delta_table FROM branch.branches WHERE name = %s",
+      quote_literal_cstr(branch_name));
+
+  ret = SPI_execute(buf.data, true, 1);
+
+  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+    ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+                    errmsg("branch \"%s\" does not exist", branch_name)));
+  }
+
+  delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+  if (delta_table == NULL) {
+    ereport(ERROR,
+            (errmsg("branch \"%s\" has no delta table (is it main?)", branch_name)));
+  }
+
+  /* Truncate the delta table */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf, "TRUNCATE branch.%s", quote_identifier(delta_table));
+
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UTILITY) {
+    ereport(ERROR,
+            (errmsg("failed to truncate delta table for branch \"%s\"", branch_name)));
+  }
+
+  SPI_finish();
+
+  elog(NOTICE, "rolled back all changes for branch \"%s\"", branch_name);
+  PG_RETURN_VOID();
+}
+
+/* ----------------------------------------------------------------
  * branch_current() -> TEXT
  *
  * Returns the name of the currently active branch.

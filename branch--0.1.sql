@@ -29,6 +29,18 @@ CREATE OR REPLACE FUNCTION branch.switch_branch(
 ) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_switch'
 LANGUAGE C STRICT;
 
+-- Apply a branch's delta log to the base table, then clear the deltas
+CREATE OR REPLACE FUNCTION branch.apply_branch(
+    branch_name TEXT
+) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_apply'
+LANGUAGE C STRICT;
+
+-- Discard all changes in a branch's delta table
+CREATE OR REPLACE FUNCTION branch.rollback_branch(
+    branch_name TEXT
+) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_rollback'
+LANGUAGE C STRICT;
+
 -- Return the name of the currently active branch
 CREATE OR REPLACE FUNCTION branch.current_branch()
 RETURNS TEXT AS 'MODULE_PATHNAME', 'branch_current'
