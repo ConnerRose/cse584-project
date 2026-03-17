@@ -39,8 +39,8 @@ void _PG_init(void) {
  * Returns NULL if no delta tables exist in the chain.
  * NOTE: invalidates SPI_tuptable.
  */
-static char*
-build_ancestor_deltas_subquery(const char* branch_name, const char* columns) {
+static char* build_ancestor_deltas_subquery(const char* branch_name,
+                                            const char* columns) {
   StringInfoData buf;
   StringInfoData result;
   int ret;
@@ -73,8 +73,8 @@ build_ancestor_deltas_subquery(const char* branch_name, const char* columns) {
   num_deltas = SPI_processed;
   delta_tables = palloc(num_deltas * sizeof(char*));
   for (i = 0; i < num_deltas; i++) {
-    delta_tables[i] = pstrdup(
-        SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1));
+    delta_tables[i] =
+        pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1));
   }
 
   /* Build the UNION ALL subquery */
@@ -539,8 +539,7 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
           SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 
       /* Walk ancestor chain to build combined delta subquery */
-      deltas_subquery =
-          build_ancestor_deltas_subquery(branch_name, columns);
+      deltas_subquery = build_ancestor_deltas_subquery(branch_name, columns);
 
       /* Build the reconstructed view query using latest delta per PK */
       resetStringInfo(&buf);
@@ -556,12 +555,11 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
                        "UNION ALL "
                        "SELECT %s FROM latest WHERE _op IN ('I','U') "
                        "ORDER BY %s",
-                       deltas_subquery,
+                       deltas_subquery, quote_identifier(pk_col), columns,
                        quote_identifier(pk_col), columns,
-                       quote_identifier(pk_col),
-                       columns, quote_identifier(base_table),
-                       quote_identifier(pk_col), quote_identifier(pk_col),
-                       columns, quote_identifier(pk_col));
+                       quote_identifier(base_table), quote_identifier(pk_col),
+                       quote_identifier(pk_col), columns,
+                       quote_identifier(pk_col));
     }
 
     ret = SPI_execute(buf.data, true, 0);
@@ -736,9 +734,8 @@ Datum branch_run(PG_FUNCTION_ARGS) {
                      quote_identifier(base_table), deltas_subquery,
                      quote_identifier(pk_col), columns,
                      quote_identifier(pk_col), columns,
-                     quote_identifier(base_table),
-                     quote_identifier(pk_col), quote_identifier(pk_col),
-                     columns);
+                     quote_identifier(base_table), quote_identifier(pk_col),
+                     quote_identifier(pk_col), columns);
   }
 
   ret = SPI_execute(buf.data, false, 0);
