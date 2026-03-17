@@ -1,0 +1,4 @@
+comment = 'Branch-aware logical redo logging for relational tables'
+default_version = '0.1'
+module_pathname = '$libdir/branch'
+relocatable = false
