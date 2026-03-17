@@ -26,6 +26,74 @@ void _PG_init(void) {
   );
 }
 
+/*
+ * Build a SQL subquery that unions all delta tables in the branch's
+ * ancestor chain, with a _depth column (0 = current, 1 = parent, ...).
+ * Must be called within an active SPI connection.
+ *
+ * Returns a palloc'd string like:
+ *   (SELECT 0 AS _depth, _op, _seq, cols FROM branch.delta1
+ *    UNION ALL
+ *    SELECT 1 AS _depth, _op, _seq, cols FROM branch.delta2)
+ *
+ * Returns NULL if no delta tables exist in the chain.
+ * NOTE: invalidates SPI_tuptable.
+ */
+static char*
+build_ancestor_deltas_subquery(const char* branch_name, const char* columns) {
+  StringInfoData buf;
+  StringInfoData result;
+  int ret;
+  uint64 i;
+  uint64 num_deltas;
+  char** delta_tables;
+
+  initStringInfo(&buf);
+  appendStringInfo(
+      &buf,
+      "WITH RECURSIVE chain AS ("
+      "  SELECT branch_id, parent_id, delta_table, 0 AS depth "
+      "  FROM branch.branches WHERE name = %s "
+      "  UNION ALL "
+      "  SELECT b.branch_id, b.parent_id, b.delta_table, c.depth + 1 "
+      "  FROM branch.branches b "
+      "  JOIN chain c ON b.branch_id = c.parent_id"
+      ") "
+      "SELECT delta_table, depth FROM chain "
+      "WHERE delta_table IS NOT NULL "
+      "ORDER BY depth",
+      quote_literal_cstr(branch_name));
+
+  ret = SPI_execute(buf.data, true, 0);
+  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+    return NULL;
+  }
+
+  /* Copy delta table names before SPI_tuptable is invalidated */
+  num_deltas = SPI_processed;
+  delta_tables = palloc(num_deltas * sizeof(char*));
+  for (i = 0; i < num_deltas; i++) {
+    delta_tables[i] = pstrdup(
+        SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1));
+  }
+
+  /* Build the UNION ALL subquery */
+  initStringInfo(&result);
+  appendStringInfoChar(&result, '(');
+  for (i = 0; i < num_deltas; i++) {
+    if (i > 0) {
+      appendStringInfo(&result, " UNION ALL ");
+    }
+    appendStringInfo(&result,
+                     "SELECT %d AS _depth, _op, _seq, %s FROM branch.%s",
+                     (int)i, columns, quote_identifier(delta_tables[i]));
+  }
+  appendStringInfoChar(&result, ')');
+
+  pfree(delta_tables);
+  return result.data;
+}
+
 /* ----------------------------------------------------------------
  * branch_create(new_branch TEXT, from_branch TEXT)
  *
@@ -436,6 +504,7 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
       /* Get column names and PK */
       char* columns;
       char* pk_col;
+      char* deltas_subquery;
 
       resetStringInfo(&buf);
       appendStringInfo(
@@ -469,20 +538,27 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
       pk_col = pstrdup(
           SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 
+      /* Walk ancestor chain to build combined delta subquery */
+      deltas_subquery =
+          build_ancestor_deltas_subquery(branch_name, columns);
+
       /* Build the reconstructed view query using latest delta per PK */
       resetStringInfo(&buf);
       appendStringInfo(&buf,
-                       "WITH latest AS ("
-                       "  SELECT DISTINCT ON (%s) _op, %s FROM branch.%s "
-                       "  ORDER BY %s, _seq DESC"
+                       "WITH all_deltas AS (SELECT * FROM %s), "
+                       "latest AS ("
+                       "  SELECT DISTINCT ON (%s) _op, %s "
+                       "  FROM all_deltas "
+                       "  ORDER BY %s, _depth ASC, _seq DESC"
                        ") "
                        "SELECT %s FROM %s "
                        "WHERE %s NOT IN (SELECT %s FROM latest) "
                        "UNION ALL "
                        "SELECT %s FROM latest WHERE _op IN ('I','U') "
                        "ORDER BY %s",
+                       deltas_subquery,
                        quote_identifier(pk_col), columns,
-                       quote_identifier(delta_table), quote_identifier(pk_col),
+                       quote_identifier(pk_col),
                        columns, quote_identifier(base_table),
                        quote_identifier(pk_col), quote_identifier(pk_col),
                        columns, quote_identifier(pk_col));
@@ -636,26 +712,34 @@ Datum branch_run(PG_FUNCTION_ARGS) {
 
   /*
    * Create a temp table with the same name as the base table, populated
-   * with the branch preview (base + latest deltas). Temp tables shadow
-   * regular tables in search_path, so the user's SQL will operate on
-   * the branch state transparently.
+   * with the branch preview (base + all ancestor deltas). Temp tables
+   * shadow regular tables in search_path, so the user's SQL will operate
+   * on the branch state transparently.
    */
-  resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "CREATE TEMP TABLE %s ON COMMIT DROP AS "
-                   "WITH latest AS ("
-                   "  SELECT DISTINCT ON (%s) _op, %s FROM branch.%s "
-                   "  ORDER BY %s, _seq DESC"
-                   ") "
-                   "SELECT %s FROM public.%s "
-                   "WHERE %s NOT IN (SELECT %s FROM latest) "
-                   "UNION ALL "
-                   "SELECT %s FROM latest WHERE _op IN ('I','U')",
-                   quote_identifier(base_table), quote_identifier(pk_col),
-                   columns, quote_identifier(delta_table),
-                   quote_identifier(pk_col), columns,
-                   quote_identifier(base_table), quote_identifier(pk_col),
-                   quote_identifier(pk_col), columns);
+  {
+    char* deltas_subquery =
+        build_ancestor_deltas_subquery(branch_name, columns);
+
+    resetStringInfo(&buf);
+    appendStringInfo(&buf,
+                     "CREATE TEMP TABLE %s ON COMMIT DROP AS "
+                     "WITH all_deltas AS (SELECT * FROM %s), "
+                     "latest AS ("
+                     "  SELECT DISTINCT ON (%s) _op, %s "
+                     "  FROM all_deltas "
+                     "  ORDER BY %s, _depth ASC, _seq DESC"
+                     ") "
+                     "SELECT %s FROM public.%s "
+                     "WHERE %s NOT IN (SELECT %s FROM latest) "
+                     "UNION ALL "
+                     "SELECT %s FROM latest WHERE _op IN ('I','U')",
+                     quote_identifier(base_table), deltas_subquery,
+                     quote_identifier(pk_col), columns,
+                     quote_identifier(pk_col), columns,
+                     quote_identifier(base_table),
+                     quote_identifier(pk_col), quote_identifier(pk_col),
+                     columns);
+  }
 
   ret = SPI_execute(buf.data, false, 0);
   if (ret != SPI_OK_UTILITY) {

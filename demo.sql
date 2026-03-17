@@ -48,19 +48,37 @@ SELECT branch.run('UPDATE users SET name = upper(name)');
 -- Preview uses only the latest delta per primary key
 SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
 
--- List all branches
+-- Create experiment2 from experiment1 BEFORE applying (inherits unapplied deltas)
+SELECT branch.create_branch('experiment2', 'experiment1');
+SELECT branch.switch_branch('experiment2');
+
+-- experiment2 inherits experiment1's changes implicitly
+SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
+
+-- Make further changes on experiment2
+SELECT branch.run('INSERT INTO users (id, name) VALUES (5, ''Eve'')');
+SELECT branch.run('UPDATE users SET name = ''diana'' WHERE id = 4');
+
+-- Preview experiment2: experiment1 deltas + experiment2 deltas
+SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
+
+-- Switch back to experiment1 — unaffected by experiment2
+SELECT branch.switch_branch('experiment1');
+SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
+
+-- List all branches showing the parent chain
 SELECT name, parent_id, base_table, delta_table FROM branch.branches;
 
--- Apply the branch: replay latest deltas into the base table
+-- Apply experiment1: replay its latest deltas into the base table
 SELECT branch.apply_branch('experiment1');
-
--- Base table now reflects the branch changes
 SELECT * FROM users ORDER BY id;
 
--- Delta table is cleared after apply
-SELECT count(*) AS remaining_deltas FROM branch.branch_delta_experiment1;
+-- Rollback experiment2's changes
+SELECT branch.switch_branch('experiment2');
+SELECT branch.rollback_branch('experiment2');
 
--- Add more deltas, then rollback to discard them
+-- Add more deltas on experiment1, then rollback
+SELECT branch.switch_branch('experiment1');
 SELECT branch.run('INSERT INTO users (id, name) VALUES (5, ''Eve'')');
 SELECT _seq, _op, id, name FROM branch.branch_delta_experiment1 ORDER BY _seq;
 
