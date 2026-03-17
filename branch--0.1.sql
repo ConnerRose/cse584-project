@@ -41,6 +41,11 @@ CREATE OR REPLACE FUNCTION branch.rollback_branch(
 ) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_rollback'
 LANGUAGE C STRICT;
 
+-- Preview the current branch state (base table + deltas applied)
+CREATE OR REPLACE FUNCTION branch.preview()
+RETURNS SETOF RECORD AS 'MODULE_PATHNAME', 'branch_preview'
+LANGUAGE C STRICT;
+
 -- Return the name of the currently active branch
 CREATE OR REPLACE FUNCTION branch.current_branch()
 RETURNS TEXT AS 'MODULE_PATHNAME', 'branch_current'

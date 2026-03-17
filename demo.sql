@@ -39,13 +39,8 @@ SELECT * FROM users;
 -- But the delta log captures branch changes
 SELECT _seq, _op, id, name FROM branch.branch_delta_experiment1 ORDER BY _seq;
 
--- Reconstruct the branch view:
--- base rows minus deletes, plus inserts, with updates applied
-SELECT id, name FROM users
-WHERE id NOT IN (SELECT id FROM branch.branch_delta_experiment1 WHERE _op IN ('D', 'U'))
-UNION ALL
-SELECT id, name FROM branch.branch_delta_experiment1 WHERE _op IN ('I', 'U')
-ORDER BY id;
+-- Preview the branch: reconstructed view without modifying the base table
+SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
 
 -- List all branches
 SELECT name, parent_id, base_table, delta_table FROM branch.branches;
