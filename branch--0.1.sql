@@ -46,6 +46,25 @@ CREATE OR REPLACE FUNCTION branch.preview()
 RETURNS SETOF RECORD AS 'MODULE_PATHNAME', 'branch_preview'
 LANGUAGE C STRICT;
 
+-- Insert a row on the current branch
+CREATE OR REPLACE FUNCTION branch.binsert(
+    data JSONB
+) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_binsert'
+LANGUAGE C STRICT;
+
+-- Delete a row on the current branch by primary key
+CREATE OR REPLACE FUNCTION branch.bdelete(
+    pk_value INTEGER
+) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_bdelete'
+LANGUAGE C STRICT;
+
+-- Update a row on the current branch by primary key with JSONB changes
+CREATE OR REPLACE FUNCTION branch.bupdate(
+    pk_value INTEGER,
+    data JSONB
+) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_bupdate'
+LANGUAGE C STRICT;
+
 -- Return the name of the currently active branch
 CREATE OR REPLACE FUNCTION branch.current_branch()
 RETURNS TEXT AS 'MODULE_PATHNAME', 'branch_current'

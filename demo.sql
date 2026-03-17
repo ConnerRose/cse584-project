@@ -28,10 +28,10 @@ SELECT branch.create_branch('experiment1', 'main');
 SELECT branch.switch_branch('experiment1');
 SELECT branch.current_branch();
 
--- Simulate branch writes via the delta table
-INSERT INTO branch.branch_delta_experiment1 (_op, id, name) VALUES ('I', 4, 'Diana');
-INSERT INTO branch.branch_delta_experiment1 (_op, id, name) VALUES ('D', 2, 'Bob');
-INSERT INTO branch.branch_delta_experiment1 (_op, id, name) VALUES ('U', 1, 'Alicia');
+-- Write to the branch using DML functions
+SELECT branch.binsert('{"id": 4, "name": "Diana"}');
+SELECT branch.bdelete(2);
+SELECT branch.bupdate(1, '{"name": "Alicia"}');
 
 -- The base table is unchanged
 SELECT * FROM users;
@@ -55,7 +55,7 @@ SELECT * FROM users ORDER BY id;
 SELECT count(*) AS remaining_deltas FROM branch.branch_delta_experiment1;
 
 -- Add more deltas, then rollback to discard them
-INSERT INTO branch.branch_delta_experiment1 (_op, id, name) VALUES ('I', 5, 'Eve');
+SELECT branch.binsert('{"id": 5, "name": "Eve"}');
 SELECT _seq, _op, id, name FROM branch.branch_delta_experiment1 ORDER BY _seq;
 
 SELECT branch.rollback_branch('experiment1');
