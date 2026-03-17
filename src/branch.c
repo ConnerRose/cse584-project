@@ -1,11 +1,13 @@
+// clang-format off
 #include "postgres.h"
+// clang-format on
+#include "access/htup_details.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
-#include "access/htup_details.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/jsonb.h"
-#include "executor/spi.h"
 
 PG_MODULE_MAGIC;
 
@@ -77,7 +79,7 @@ Datum branch_create(PG_FUNCTION_ARGS) {
         "CREATE TABLE branch.%s ("
         "  _op CHAR(1) NOT NULL," /* 'I'nsert, 'D'elete, 'U'pdate */
         "  _seq BIGSERIAL,"
-        "  LIKE %s INCLUDING ALL"
+        "  LIKE %s INCLUDING DEFAULTS"
         ")",
         quote_identifier(delta_table), quote_identifier(base_table));
 
@@ -185,22 +187,22 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
   delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
 
   if (delta_table == NULL) {
-    ereport(ERROR,
-            (errmsg("branch \"%s\" has no delta table (is it main?)", branch_name)));
+    ereport(ERROR, (errmsg("branch \"%s\" has no delta table (is it main?)",
+                           branch_name)));
   }
 
   /* Get column names from the base table (excluding delta metadata cols) */
   resetStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "SELECT string_agg(column_name, ', ') "
-      "FROM information_schema.columns "
-      "WHERE table_name = %s AND table_schema = 'public'",
-      quote_literal_cstr(base_table));
+  appendStringInfo(&buf,
+                   "SELECT string_agg(column_name, ', ') "
+                   "FROM information_schema.columns "
+                   "WHERE table_name = %s AND table_schema = 'public'",
+                   quote_literal_cstr(base_table));
 
   ret = SPI_execute(buf.data, true, 1);
   if (ret != SPI_OK_SELECT || SPI_processed == 0) {
-    ereport(ERROR, (errmsg("could not read columns for table \"%s\"", base_table)));
+    ereport(ERROR,
+            (errmsg("could not read columns for table \"%s\"", base_table)));
   }
 
   {
@@ -209,32 +211,47 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
 
     /* Get the primary key column name */
     resetStringInfo(&buf);
-    appendStringInfo(
-        &buf,
-        "SELECT a.attname FROM pg_index i "
-        "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-        "AND a.attnum = ANY(i.indkey) "
-        "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-        quote_literal_cstr(base_table));
+    appendStringInfo(&buf,
+                     "SELECT a.attname FROM pg_index i "
+                     "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+                     "AND a.attnum = ANY(i.indkey) "
+                     "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+                     quote_literal_cstr(base_table));
 
     ret = SPI_execute(buf.data, true, 1);
     if (ret != SPI_OK_SELECT || SPI_processed == 0) {
-      ereport(ERROR,
-              (errmsg("could not determine primary key for \"%s\"", base_table)));
+      ereport(ERROR, (errmsg("could not determine primary key for \"%s\"",
+                             base_table)));
     }
 
     {
       char* pk_col =
           SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 
+      /*
+       * Materialize the latest delta per PK into a temp table so we
+       * apply only the most recent operation for each row.
+       */
+      resetStringInfo(&buf);
+      appendStringInfo(&buf,
+                       "CREATE TEMP TABLE _branch_apply_latest AS "
+                       "SELECT DISTINCT ON (%s) _op, %s FROM branch.%s "
+                       "ORDER BY %s, _seq DESC",
+                       quote_identifier(pk_col), columns,
+                       quote_identifier(delta_table), quote_identifier(pk_col));
+
+      ret = SPI_execute(buf.data, false, 0);
+      if (ret != SPI_OK_UTILITY) {
+        ereport(ERROR, (errmsg("failed to materialize latest deltas")));
+      }
+
       /* Apply inserts */
       resetStringInfo(&buf);
       appendStringInfo(&buf,
                        "INSERT INTO %s (%s) "
-                       "SELECT %s FROM branch.%s "
-                       "WHERE _op = 'I' ORDER BY _seq",
-                       quote_identifier(base_table), columns, columns,
-                       quote_identifier(delta_table));
+                       "SELECT %s FROM _branch_apply_latest "
+                       "WHERE _op = 'I'",
+                       quote_identifier(base_table), columns, columns);
 
       ret = SPI_execute(buf.data, false, 0);
       if (ret != SPI_OK_INSERT) {
@@ -246,9 +263,9 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
       resetStringInfo(&buf);
       appendStringInfo(&buf,
                        "DELETE FROM %s WHERE %s IN "
-                       "(SELECT %s FROM branch.%s WHERE _op = 'D')",
+                       "(SELECT %s FROM _branch_apply_latest WHERE _op = 'D')",
                        quote_identifier(base_table), quote_identifier(pk_col),
-                       quote_identifier(pk_col), quote_identifier(delta_table));
+                       quote_identifier(pk_col));
 
       ret = SPI_execute(buf.data, false, 0);
       if (ret != SPI_OK_DELETE) {
@@ -260,9 +277,9 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
       resetStringInfo(&buf);
       appendStringInfo(&buf,
                        "DELETE FROM %s WHERE %s IN "
-                       "(SELECT %s FROM branch.%s WHERE _op = 'U')",
+                       "(SELECT %s FROM _branch_apply_latest WHERE _op = 'U')",
                        quote_identifier(base_table), quote_identifier(pk_col),
-                       quote_identifier(pk_col), quote_identifier(delta_table));
+                       quote_identifier(pk_col));
 
       ret = SPI_execute(buf.data, false, 0);
       if (ret != SPI_OK_DELETE) {
@@ -274,10 +291,9 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
       resetStringInfo(&buf);
       appendStringInfo(&buf,
                        "INSERT INTO %s (%s) "
-                       "SELECT %s FROM branch.%s "
-                       "WHERE _op = 'U' ORDER BY _seq",
-                       quote_identifier(base_table), columns, columns,
-                       quote_identifier(delta_table));
+                       "SELECT %s FROM _branch_apply_latest "
+                       "WHERE _op = 'U'",
+                       quote_identifier(base_table), columns, columns);
 
       ret = SPI_execute(buf.data, false, 0);
       if (ret != SPI_OK_INSERT) {
@@ -285,6 +301,9 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
                                "branch \"%s\"",
                                branch_name)));
       }
+
+      /* Drop the temp table */
+      SPI_execute("DROP TABLE _branch_apply_latest", false, 0);
     }
   }
 
@@ -294,8 +313,8 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
 
   ret = SPI_execute(buf.data, false, 0);
   if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR,
-            (errmsg("failed to truncate delta table for branch \"%s\"", branch_name)));
+    ereport(ERROR, (errmsg("failed to truncate delta table for branch \"%s\"",
+                           branch_name)));
   }
 
   SPI_finish();
@@ -324,9 +343,9 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
 
   /* Look up the delta table */
   initStringInfo(&buf);
-  appendStringInfo(
-      &buf, "SELECT delta_table FROM branch.branches WHERE name = %s",
-      quote_literal_cstr(branch_name));
+  appendStringInfo(&buf,
+                   "SELECT delta_table FROM branch.branches WHERE name = %s",
+                   quote_literal_cstr(branch_name));
 
   ret = SPI_execute(buf.data, true, 1);
 
@@ -338,8 +357,8 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
   delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 
   if (delta_table == NULL) {
-    ereport(ERROR,
-            (errmsg("branch \"%s\" has no delta table (is it main?)", branch_name)));
+    ereport(ERROR, (errmsg("branch \"%s\" has no delta table (is it main?)",
+                           branch_name)));
   }
 
   /* Truncate the delta table */
@@ -348,8 +367,8 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
 
   ret = SPI_execute(buf.data, false, 0);
   if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR,
-            (errmsg("failed to truncate delta table for branch \"%s\"", branch_name)));
+    ereport(ERROR, (errmsg("failed to truncate delta table for branch \"%s\"",
+                           branch_name)));
   }
 
   SPI_finish();
@@ -404,8 +423,7 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
 
     base_table =
         pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
-    delta_table =
-        SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+    delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
     if (delta_table != NULL) {
       delta_table = pstrdup(delta_table);
     }
@@ -429,42 +447,45 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
 
       ret = SPI_execute(buf.data, true, 1);
       if (ret != SPI_OK_SELECT || SPI_processed == 0) {
-        ereport(ERROR,
-                (errmsg("could not read columns for table \"%s\"", base_table)));
+        ereport(ERROR, (errmsg("could not read columns for table \"%s\"",
+                               base_table)));
       }
-      columns =
-          pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+      columns = pstrdup(
+          SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 
       resetStringInfo(&buf);
-      appendStringInfo(
-          &buf,
-          "SELECT a.attname FROM pg_index i "
-          "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-          "AND a.attnum = ANY(i.indkey) "
-          "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-          quote_literal_cstr(base_table));
+      appendStringInfo(&buf,
+                       "SELECT a.attname FROM pg_index i "
+                       "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+                       "AND a.attnum = ANY(i.indkey) "
+                       "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+                       quote_literal_cstr(base_table));
 
       ret = SPI_execute(buf.data, true, 1);
       if (ret != SPI_OK_SELECT || SPI_processed == 0) {
         ereport(ERROR, (errmsg("could not determine primary key for \"%s\"",
                                base_table)));
       }
-      pk_col =
-          pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+      pk_col = pstrdup(
+          SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 
-      /* Build the reconstructed view query */
+      /* Build the reconstructed view query using latest delta per PK */
       resetStringInfo(&buf);
-      appendStringInfo(
-          &buf,
-          "SELECT %s FROM %s "
-          "WHERE %s NOT IN (SELECT %s FROM branch.%s WHERE _op IN ('D','U')) "
-          "UNION ALL "
-          "SELECT %s FROM branch.%s WHERE _op IN ('I','U') "
-          "ORDER BY %s",
-          columns, quote_identifier(base_table),
-          quote_identifier(pk_col), quote_identifier(pk_col),
-          quote_identifier(delta_table), columns,
-          quote_identifier(delta_table), quote_identifier(pk_col));
+      appendStringInfo(&buf,
+                       "WITH latest AS ("
+                       "  SELECT DISTINCT ON (%s) _op, %s FROM branch.%s "
+                       "  ORDER BY %s, _seq DESC"
+                       ") "
+                       "SELECT %s FROM %s "
+                       "WHERE %s NOT IN (SELECT %s FROM latest) "
+                       "UNION ALL "
+                       "SELECT %s FROM latest WHERE _op IN ('I','U') "
+                       "ORDER BY %s",
+                       quote_identifier(pk_col), columns,
+                       quote_identifier(delta_table), quote_identifier(pk_col),
+                       columns, quote_identifier(base_table),
+                       quote_identifier(pk_col), quote_identifier(pk_col),
+                       columns, quote_identifier(pk_col));
     }
 
     ret = SPI_execute(buf.data, true, 0);
@@ -477,10 +498,12 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
 
     /* Use the caller-supplied tuple descriptor from the AS clause */
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE) {
-      ereport(ERROR,
-              (errmsg("branch.preview() must be called with a column "
-                      "definition list, e.g.: "
-                      "SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT)")));
+      ereport(
+          ERROR,
+          (errmsg(
+              "branch.preview() must be called with a column "
+              "definition list, e.g.: "
+              "SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT)")));
     }
     BlessTupleDesc(tupdesc);
     funcctx->tuple_desc = tupdesc;
@@ -515,6 +538,192 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
     SPI_finish();
     SRF_RETURN_DONE(funcctx);
   }
+}
+
+/* ----------------------------------------------------------------
+ * branch_run(sql TEXT)
+ *
+ * Executes arbitrary SQL (INSERT/UPDATE/DELETE) against the base
+ * table, but intercepts row-level effects via BEFORE ROW triggers
+ * that capture changes into the delta table and suppress the
+ * actual base table modification.
+ * ----------------------------------------------------------------
+ */
+PG_FUNCTION_INFO_V1(branch_run);
+
+Datum branch_run(PG_FUNCTION_ARGS) {
+  text* sql_t = PG_GETARG_TEXT_PP(0);
+  char* sql = text_to_cstring(sql_t);
+  const char* branch_name;
+  int ret;
+  StringInfoData buf;
+  char* base_table;
+  char* delta_table;
+  char* columns;
+  char* new_columns;
+  char* old_columns;
+  char* pk_col;
+
+  branch_name = GetConfigOption("branch.active_branch", false, false);
+
+  SPI_connect();
+
+  /* Look up branch metadata */
+  initStringInfo(&buf);
+  appendStringInfo(
+      &buf,
+      "SELECT base_table, delta_table FROM branch.branches WHERE name = %s",
+      quote_literal_cstr(branch_name));
+
+  ret = SPI_execute(buf.data, true, 1);
+
+  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+    ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+                    errmsg("branch \"%s\" does not exist", branch_name)));
+  }
+
+  base_table =
+      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+  delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+
+  if (delta_table == NULL) {
+    ereport(ERROR, (errmsg("branch \"%s\" has no delta table (is it main?)",
+                           branch_name)));
+  }
+  delta_table = pstrdup(delta_table);
+
+  /* Get column lists: plain, NEW.-prefixed, OLD.-prefixed */
+  resetStringInfo(&buf);
+  appendStringInfo(
+      &buf,
+      "SELECT string_agg(column_name, ', ' ORDER BY ordinal_position), "
+      "string_agg('NEW.' || column_name, ', ' ORDER BY ordinal_position), "
+      "string_agg('OLD.' || column_name, ', ' ORDER BY ordinal_position) "
+      "FROM information_schema.columns "
+      "WHERE table_name = %s AND table_schema = 'public'",
+      quote_literal_cstr(base_table));
+
+  ret = SPI_execute(buf.data, true, 1);
+  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+    ereport(ERROR,
+            (errmsg("could not read columns for table \"%s\"", base_table)));
+  }
+
+  columns =
+      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+  new_columns =
+      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2));
+  old_columns =
+      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3));
+
+  /* Get primary key column */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf,
+                   "SELECT a.attname FROM pg_index i "
+                   "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+                   "AND a.attnum = ANY(i.indkey) "
+                   "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+                   quote_literal_cstr(base_table));
+
+  ret = SPI_execute(buf.data, true, 1);
+  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+    ereport(ERROR,
+            (errmsg("could not determine primary key for \"%s\"", base_table)));
+  }
+
+  pk_col =
+      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+
+  /*
+   * Create a temp table with the same name as the base table, populated
+   * with the branch preview (base + latest deltas). Temp tables shadow
+   * regular tables in search_path, so the user's SQL will operate on
+   * the branch state transparently.
+   */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf,
+                   "CREATE TEMP TABLE %s ON COMMIT DROP AS "
+                   "WITH latest AS ("
+                   "  SELECT DISTINCT ON (%s) _op, %s FROM branch.%s "
+                   "  ORDER BY %s, _seq DESC"
+                   ") "
+                   "SELECT %s FROM public.%s "
+                   "WHERE %s NOT IN (SELECT %s FROM latest) "
+                   "UNION ALL "
+                   "SELECT %s FROM latest WHERE _op IN ('I','U')",
+                   quote_identifier(base_table), quote_identifier(pk_col),
+                   columns, quote_identifier(delta_table),
+                   quote_identifier(pk_col), columns,
+                   quote_identifier(base_table), quote_identifier(pk_col),
+                   quote_identifier(pk_col), columns);
+
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UTILITY) {
+    ereport(ERROR, (errmsg("failed to create branch preview table")));
+  }
+
+  /* Create the trigger function that captures changes into the delta table */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf,
+                   "CREATE OR REPLACE FUNCTION branch._run_trigger_fn() "
+                   "RETURNS TRIGGER AS $t$ "
+                   "BEGIN "
+                   "  IF TG_OP = 'INSERT' THEN "
+                   "    INSERT INTO branch.%s (_op, %s) VALUES ('I', %s); "
+                   "    RETURN NULL; "
+                   "  ELSIF TG_OP = 'DELETE' THEN "
+                   "    INSERT INTO branch.%s (_op, %s) VALUES ('D', %s); "
+                   "    RETURN NULL; "
+                   "  ELSIF TG_OP = 'UPDATE' THEN "
+                   "    INSERT INTO branch.%s (_op, %s) VALUES ('U', %s); "
+                   "    RETURN NULL; "
+                   "  END IF; "
+                   "  RETURN NULL; "
+                   "END; "
+                   "$t$ LANGUAGE plpgsql",
+                   quote_identifier(delta_table), columns, new_columns,
+                   quote_identifier(delta_table), columns, old_columns,
+                   quote_identifier(delta_table), columns, new_columns);
+
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UTILITY) {
+    ereport(ERROR, (errmsg("failed to create trigger function")));
+  }
+
+  /* Create the BEFORE ROW trigger on the temp table */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf,
+                   "CREATE TRIGGER _branch_run_trigger "
+                   "BEFORE INSERT OR UPDATE OR DELETE ON %s "
+                   "FOR EACH ROW EXECUTE FUNCTION branch._run_trigger_fn()",
+                   quote_identifier(base_table));
+
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UTILITY) {
+    ereport(ERROR, (errmsg("failed to create trigger on \"%s\"", base_table)));
+  }
+
+  /* Execute the user's SQL — hits temp table, triggers capture deltas */
+  ret = SPI_execute(sql, false, 0);
+  if (ret < 0) {
+    ereport(ERROR,
+            (errmsg("failed to execute SQL on branch \"%s\"", branch_name)));
+  }
+
+  /* Clean up: drop temp table (trigger goes with it) and function */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf, "DROP TABLE IF EXISTS pg_temp.%s",
+                   quote_identifier(base_table));
+  SPI_execute(buf.data, false, 0);
+
+  resetStringInfo(&buf);
+  appendStringInfo(&buf, "DROP FUNCTION IF EXISTS branch._run_trigger_fn()");
+  SPI_execute(buf.data, false, 0);
+
+  SPI_finish();
+
+  elog(NOTICE, "executed SQL on branch \"%s\"", branch_name);
+  PG_RETURN_VOID();
 }
 
 /* ----------------------------------------------------------------
@@ -559,8 +768,7 @@ Datum branch_binsert(PG_FUNCTION_ARGS) {
 
   base_table =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
-  delta_table =
-      SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+  delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
 
   if (delta_table == NULL) {
     ereport(ERROR, (errmsg("branch \"%s\" has no delta table (is it main?)",
@@ -591,13 +799,12 @@ Datum branch_binsert(PG_FUNCTION_ARGS) {
 
   /* Insert into delta via jsonb_populate_record */
   resetStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "INSERT INTO branch.%s (_op, %s) "
-      "SELECT 'I', %s "
-      "FROM jsonb_populate_record(NULL::%s, %s::jsonb) AS r",
-      quote_identifier(delta_table), columns, r_columns,
-      quote_identifier(base_table), quote_literal_cstr(data_str));
+  appendStringInfo(&buf,
+                   "INSERT INTO branch.%s (_op, %s) "
+                   "SELECT 'I', %s "
+                   "FROM jsonb_populate_record(NULL::%s, %s::jsonb) AS r",
+                   quote_identifier(delta_table), columns, r_columns,
+                   quote_identifier(base_table), quote_literal_cstr(data_str));
 
   ret = SPI_execute(buf.data, false, 0);
   if (ret != SPI_OK_INSERT) {
@@ -648,8 +855,7 @@ Datum branch_bdelete(PG_FUNCTION_ARGS) {
 
   base_table =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
-  delta_table =
-      SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+  delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
 
   if (delta_table == NULL) {
     ereport(ERROR, (errmsg("branch \"%s\" has no delta table (is it main?)",
@@ -677,13 +883,12 @@ Datum branch_bdelete(PG_FUNCTION_ARGS) {
 
   /* Get primary key column */
   resetStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "SELECT a.attname FROM pg_index i "
-      "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-      "AND a.attnum = ANY(i.indkey) "
-      "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-      quote_literal_cstr(base_table));
+  appendStringInfo(&buf,
+                   "SELECT a.attname FROM pg_index i "
+                   "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+                   "AND a.attnum = ANY(i.indkey) "
+                   "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+                   quote_literal_cstr(base_table));
 
   ret = SPI_execute(buf.data, true, 1);
   if (ret != SPI_OK_SELECT || SPI_processed == 0) {
@@ -696,12 +901,12 @@ Datum branch_bdelete(PG_FUNCTION_ARGS) {
 
   /* Copy the row from base table into delta with _op='D' */
   resetStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "INSERT INTO branch.%s (_op, %s) "
-      "SELECT 'D', %s FROM %s WHERE %s = %d",
-      quote_identifier(delta_table), columns, columns,
-      quote_identifier(base_table), quote_identifier(pk_col), pk_value);
+  appendStringInfo(&buf,
+                   "INSERT INTO branch.%s (_op, %s) "
+                   "SELECT 'D', %s FROM %s WHERE %s = %d",
+                   quote_identifier(delta_table), columns, columns,
+                   quote_identifier(base_table), quote_identifier(pk_col),
+                   pk_value);
 
   ret = SPI_execute(buf.data, false, 0);
   if (ret != SPI_OK_INSERT) {
@@ -710,9 +915,8 @@ Datum branch_bdelete(PG_FUNCTION_ARGS) {
   }
 
   if (SPI_processed == 0) {
-    ereport(ERROR,
-            (errmsg("row with %s = %d not found in \"%s\"",
-                    pk_col, pk_value, base_table)));
+    ereport(ERROR, (errmsg("row with %s = %d not found in \"%s\"", pk_col,
+                           pk_value, base_table)));
   }
 
   SPI_finish();
@@ -763,8 +967,7 @@ Datum branch_bupdate(PG_FUNCTION_ARGS) {
 
   base_table =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
-  delta_table =
-      SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+  delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
 
   if (delta_table == NULL) {
     ereport(ERROR, (errmsg("branch \"%s\" has no delta table (is it main?)",
@@ -795,13 +998,12 @@ Datum branch_bupdate(PG_FUNCTION_ARGS) {
 
   /* Get primary key column */
   resetStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "SELECT a.attname FROM pg_index i "
-      "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-      "AND a.attnum = ANY(i.indkey) "
-      "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-      quote_literal_cstr(base_table));
+  appendStringInfo(&buf,
+                   "SELECT a.attname FROM pg_index i "
+                   "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+                   "AND a.attnum = ANY(i.indkey) "
+                   "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+                   quote_literal_cstr(base_table));
 
   ret = SPI_execute(buf.data, true, 1);
   if (ret != SPI_OK_SELECT || SPI_processed == 0) {
@@ -814,28 +1016,25 @@ Datum branch_bupdate(PG_FUNCTION_ARGS) {
 
   /* Overlay JSONB onto existing row and insert as 'U' delta */
   resetStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "INSERT INTO branch.%s (_op, %s) "
-      "SELECT 'U', %s "
-      "FROM jsonb_populate_record("
-      "  (SELECT b FROM %s b WHERE %s = %d), "
-      "  %s::jsonb"
-      ") AS r",
-      quote_identifier(delta_table), columns, r_columns,
-      quote_identifier(base_table), quote_identifier(pk_col), pk_value,
-      quote_literal_cstr(data_str));
+  appendStringInfo(&buf,
+                   "INSERT INTO branch.%s (_op, %s) "
+                   "SELECT 'U', %s "
+                   "FROM jsonb_populate_record("
+                   "  (SELECT b FROM %s b WHERE %s = %d), "
+                   "  %s::jsonb"
+                   ") AS r",
+                   quote_identifier(delta_table), columns, r_columns,
+                   quote_identifier(base_table), quote_identifier(pk_col),
+                   pk_value, quote_literal_cstr(data_str));
 
   ret = SPI_execute(buf.data, false, 0);
   if (ret != SPI_OK_INSERT) {
-    ereport(ERROR,
-            (errmsg("failed to update on branch \"%s\"", branch_name)));
+    ereport(ERROR, (errmsg("failed to update on branch \"%s\"", branch_name)));
   }
 
   if (SPI_processed == 0) {
-    ereport(ERROR,
-            (errmsg("row with %s = %d not found in \"%s\"",
-                    pk_col, pk_value, base_table)));
+    ereport(ERROR, (errmsg("row with %s = %d not found in \"%s\"", pk_col,
+                           pk_value, base_table)));
   }
 
   SPI_finish();

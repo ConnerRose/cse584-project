@@ -46,6 +46,12 @@ CREATE OR REPLACE FUNCTION branch.preview()
 RETURNS SETOF RECORD AS 'MODULE_PATHNAME', 'branch_preview'
 LANGUAGE C STRICT;
 
+-- Execute SQL on the current branch (captures changes as deltas)
+CREATE OR REPLACE FUNCTION branch.run(
+    sql TEXT
+) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_run'
+LANGUAGE C STRICT;
+
 -- Insert a row on the current branch
 CREATE OR REPLACE FUNCTION branch.binsert(
     data JSONB
