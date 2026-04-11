@@ -276,14 +276,17 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
     char* columns =
         SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 
-    /* Get the primary key column name */
+    /* Get the primary key column names (composite-PK aware, ordered) */
     resetStringInfo(&buf);
-    appendStringInfo(&buf,
-                     "SELECT a.attname FROM pg_index i "
-                     "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-                     "AND a.attnum = ANY(i.indkey) "
-                     "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-                     quote_literal_cstr(base_table));
+    appendStringInfo(
+        &buf,
+        "SELECT string_agg(quote_ident(a.attname), ', ' "
+        "  ORDER BY array_position(i.indkey::int[], a.attnum::int)) "
+        "FROM pg_index i "
+        "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "AND a.attnum = ANY(i.indkey) "
+        "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+        quote_literal_cstr(base_table));
 
     ret = SPI_execute(buf.data, true, 1);
     if (ret != SPI_OK_SELECT || SPI_processed == 0) {
@@ -292,8 +295,12 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
     }
 
     {
-      char* pk_col =
+      char* pk_cols =
           SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+      if (pk_cols == NULL) {
+        ereport(ERROR, (errmsg("table \"%s\" has no primary key", base_table)));
+      }
 
       /*
        * Materialize the latest delta per PK into a temp table so we
@@ -304,8 +311,8 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
                        "CREATE TEMP TABLE _branch_apply_latest AS "
                        "SELECT DISTINCT ON (%s) _op, %s FROM branch.%s "
                        "ORDER BY %s, _seq DESC",
-                       quote_identifier(pk_col), columns,
-                       quote_identifier(delta_table), quote_identifier(pk_col));
+                       pk_cols, columns, quote_identifier(delta_table),
+                       pk_cols);
 
       ret = SPI_execute(buf.data, false, 0);
       if (ret != SPI_OK_UTILITY) {
@@ -329,10 +336,9 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
       /* Apply deletes */
       resetStringInfo(&buf);
       appendStringInfo(&buf,
-                       "DELETE FROM %s WHERE %s IN "
+                       "DELETE FROM %s WHERE (%s) IN "
                        "(SELECT %s FROM _branch_apply_latest WHERE _op = 'D')",
-                       quote_identifier(base_table), quote_identifier(pk_col),
-                       quote_identifier(pk_col));
+                       quote_identifier(base_table), pk_cols, pk_cols);
 
       ret = SPI_execute(buf.data, false, 0);
       if (ret != SPI_OK_DELETE) {
@@ -343,10 +349,9 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
       /* Apply updates: delete old rows then insert updated rows */
       resetStringInfo(&buf);
       appendStringInfo(&buf,
-                       "DELETE FROM %s WHERE %s IN "
+                       "DELETE FROM %s WHERE (%s) IN "
                        "(SELECT %s FROM _branch_apply_latest WHERE _op = 'U')",
-                       quote_identifier(base_table), quote_identifier(pk_col),
-                       quote_identifier(pk_col));
+                       quote_identifier(base_table), pk_cols, pk_cols);
 
       ret = SPI_execute(buf.data, false, 0);
       if (ret != SPI_OK_DELETE) {
@@ -502,7 +507,7 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
     } else {
       /* Get column names and PK */
       char* columns;
-      char* pk_col;
+      char* pk_cols;
       char* deltas_subquery;
 
       resetStringInfo(&buf);
@@ -522,19 +527,22 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
           SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 
       resetStringInfo(&buf);
-      appendStringInfo(&buf,
-                       "SELECT a.attname FROM pg_index i "
-                       "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-                       "AND a.attnum = ANY(i.indkey) "
-                       "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-                       quote_literal_cstr(base_table));
+      appendStringInfo(
+          &buf,
+          "SELECT string_agg(quote_ident(a.attname), ', ' "
+          "  ORDER BY array_position(i.indkey::int[], a.attnum::int)) "
+          "FROM pg_index i "
+          "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+          "AND a.attnum = ANY(i.indkey) "
+          "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+          quote_literal_cstr(base_table));
 
       ret = SPI_execute(buf.data, true, 1);
       if (ret != SPI_OK_SELECT || SPI_processed == 0) {
         ereport(ERROR, (errmsg("could not determine primary key for \"%s\"",
                                base_table)));
       }
-      pk_col = pstrdup(
+      pk_cols = pstrdup(
           SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 
       /* Walk ancestor chain to build combined delta subquery */
@@ -550,15 +558,13 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
                        "  ORDER BY %s, _depth ASC, _seq DESC"
                        ") "
                        "SELECT %s FROM %s "
-                       "WHERE %s NOT IN (SELECT %s FROM latest) "
+                       "WHERE (%s) NOT IN (SELECT %s FROM latest) "
                        "UNION ALL "
                        "SELECT %s FROM latest WHERE _op IN ('I','U') "
                        "ORDER BY %s",
-                       deltas_subquery, quote_identifier(pk_col), columns,
-                       quote_identifier(pk_col), columns,
-                       quote_identifier(base_table), quote_identifier(pk_col),
-                       quote_identifier(pk_col), columns,
-                       quote_identifier(pk_col));
+                       deltas_subquery, pk_cols, columns, pk_cols, columns,
+                       quote_identifier(base_table), pk_cols, pk_cols, columns,
+                       pk_cols);
     }
 
     ret = SPI_execute(buf.data, true, 0);
@@ -635,7 +641,7 @@ Datum branch_run(PG_FUNCTION_ARGS) {
   char* columns;
   char* new_columns;
   char* old_columns;
-  char* pk_col;
+  char* pk_cols;
 
   branch_name = GetConfigOption("branch.active_branch", false, false);
 
@@ -689,14 +695,17 @@ Datum branch_run(PG_FUNCTION_ARGS) {
   old_columns =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3));
 
-  /* Get primary key column */
+  /* Get primary key columns (composite-PK aware, ordered) */
   resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "SELECT a.attname FROM pg_index i "
-                   "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-                   "AND a.attnum = ANY(i.indkey) "
-                   "WHERE i.indrelid = %s::regclass AND i.indisprimary",
-                   quote_literal_cstr(base_table));
+  appendStringInfo(
+      &buf,
+      "SELECT string_agg(quote_ident(a.attname), ', ' "
+      "  ORDER BY array_position(i.indkey::int[], a.attnum::int)) "
+      "FROM pg_index i "
+      "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+      "AND a.attnum = ANY(i.indkey) "
+      "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+      quote_literal_cstr(base_table));
 
   ret = SPI_execute(buf.data, true, 1);
   if (ret != SPI_OK_SELECT || SPI_processed == 0) {
@@ -704,7 +713,7 @@ Datum branch_run(PG_FUNCTION_ARGS) {
             (errmsg("could not determine primary key for \"%s\"", base_table)));
   }
 
-  pk_col =
+  pk_cols =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 
   /*
@@ -727,14 +736,12 @@ Datum branch_run(PG_FUNCTION_ARGS) {
                      "  ORDER BY %s, _depth ASC, _seq DESC"
                      ") "
                      "SELECT %s FROM public.%s "
-                     "WHERE %s NOT IN (SELECT %s FROM latest) "
+                     "WHERE (%s) NOT IN (SELECT %s FROM latest) "
                      "UNION ALL "
                      "SELECT %s FROM latest WHERE _op IN ('I','U')",
-                     quote_identifier(base_table), deltas_subquery,
-                     quote_identifier(pk_col), columns,
-                     quote_identifier(pk_col), columns,
-                     quote_identifier(base_table), quote_identifier(pk_col),
-                     quote_identifier(pk_col), columns);
+                     quote_identifier(base_table), deltas_subquery, pk_cols,
+                     columns, pk_cols, columns, quote_identifier(base_table),
+                     pk_cols, pk_cols, columns);
   }
 
   ret = SPI_execute(buf.data, false, 0);
