@@ -46,12 +46,6 @@ CREATE OR REPLACE FUNCTION branch.preview()
 RETURNS SETOF RECORD AS 'MODULE_PATHNAME', 'branch_preview'
 LANGUAGE C STRICT;
 
--- Execute SQL on the current branch (captures changes as deltas)
-CREATE OR REPLACE FUNCTION branch.run(
-    sql TEXT
-) RETURNS VOID AS 'MODULE_PATHNAME', 'branch_run'
-LANGUAGE C STRICT;
-
 -- Return the name of the currently active branch
 CREATE OR REPLACE FUNCTION branch.current_branch()
 RETURNS TEXT AS 'MODULE_PATHNAME', 'branch_current'
