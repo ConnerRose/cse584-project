@@ -14,3 +14,6 @@ regression.out
 
 # Editor/IDE
 .clangd
+
+.cache/
+*.plan.md

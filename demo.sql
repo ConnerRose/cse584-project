@@ -1,5 +1,10 @@
 -- Branch Extension Demo
 -- Run with: psql postgres -f demo.sql
+--
+-- If you see "function branch.run does not exist" (or preview/apply/rollback),
+-- the extension files in PostgreSQL are stale. From the project root run:
+--   make && make install
+-- then re-run this script (it DROP/CREATEs the extension).
 
 -- Start fresh
 DROP EXTENSION IF EXISTS branch CASCADE;
@@ -29,9 +34,9 @@ SELECT branch.switch_branch('experiment1');
 SELECT branch.current_branch();
 
 -- Write to the branch using branch.run() with standard SQL
-SELECT branch.run('INSERT INTO users (id, name) VALUES (4, ''Diana'')');
-SELECT branch.run('DELETE FROM users WHERE id = 2');
-SELECT branch.run('UPDATE users SET name = ''Alicia'' WHERE id = 1');
+SELECT branch.run('INSERT INTO users (id, name) VALUES (4, ''Diana'')'::text);
+SELECT branch.run('DELETE FROM users WHERE id = 2'::text);
+SELECT branch.run('UPDATE users SET name = ''Alicia'' WHERE id = 1'::text);
 
 -- The base table is unchanged
 SELECT * FROM users;
@@ -43,7 +48,7 @@ SELECT _seq, _op, id, name FROM branch.branch_delta_experiment1 ORDER BY _seq;
 SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
 
 -- Bulk operations work too
-SELECT branch.run('UPDATE users SET name = upper(name)');
+SELECT branch.run('UPDATE users SET name = upper(name)'::text);
 
 -- Preview uses only the latest delta per primary key
 SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
@@ -56,8 +61,8 @@ SELECT branch.switch_branch('experiment2');
 SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
 
 -- Make further changes on experiment2
-SELECT branch.run('INSERT INTO users (id, name) VALUES (5, ''Eve'')');
-SELECT branch.run('UPDATE users SET name = ''diana'' WHERE id = 4');
+SELECT branch.run('INSERT INTO users (id, name) VALUES (5, ''Eve'')'::text);
+SELECT branch.run('UPDATE users SET name = ''diana'' WHERE id = 4'::text);
 
 -- Preview experiment2: experiment1 deltas + experiment2 deltas
 SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
@@ -70,19 +75,19 @@ SELECT * FROM branch.preview() AS t(id INTEGER, name TEXT);
 SELECT name, parent_id, base_table, delta_table FROM branch.branches;
 
 -- Apply experiment1: replay its latest deltas into the base table
-SELECT branch.apply_branch('experiment1');
+SELECT branch.apply_branch('experiment1'::text);
 SELECT * FROM users ORDER BY id;
 
 -- Rollback experiment2's changes
 SELECT branch.switch_branch('experiment2');
-SELECT branch.rollback_branch('experiment2');
+SELECT branch.rollback_branch('experiment2'::text);
 
 -- Add more deltas on experiment1, then rollback
 SELECT branch.switch_branch('experiment1');
-SELECT branch.run('INSERT INTO users (id, name) VALUES (5, ''Eve'')');
+SELECT branch.run('INSERT INTO users (id, name) VALUES (5, ''Eve'')'::text);
 SELECT _seq, _op, id, name FROM branch.branch_delta_experiment1 ORDER BY _seq;
 
-SELECT branch.rollback_branch('experiment1');
+SELECT branch.rollback_branch('experiment1'::text);
 
 -- Deltas discarded, base table unchanged
 SELECT count(*) AS remaining_deltas FROM branch.branch_delta_experiment1;
