@@ -15,5 +15,11 @@ regression.out
 # Editor/IDE
 .clangd
 
+# TPC-H benchmark artifacts
+bench/tpch/tpch-kit/
+bench/tpch/data/
+bench/tpch/queries/
+bench/tpch/results.csv
+
 .cache/
 *.plan.md
