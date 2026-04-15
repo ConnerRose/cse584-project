@@ -62,11 +62,25 @@ if ! ls "$QUERIES_DIR"/q*.sql >/dev/null 2>&1; then
     echo "==> Generating queries..."
     export DSS_QUERY="$DBGEN_DIR/queries"
     for i in $(seq 1 22); do
-        # Strip qgen cruft: leading "select"-prefix comment line and "limit -1"
+        # Strip qgen cruft: "limit -1" and non-PostgreSQL interval precision "(3)"
         (cd "$DBGEN_DIR" && ./qgen -s "$SF" "$i") \
-            | sed -e 's/limit -1//' -e 's/limit [0-9]\+/& /' \
+            | sed -e 's/limit -1//' -e 's/day ([0-9]*)/day/' \
             > "$QUERIES_DIR/q$i.sql"
     done
+
+    # Fix qgen putting "limit N;" as a separate statement after the ";"
+    python3 -c "
+import re, glob
+for f in glob.glob('$QUERIES_DIR/q*.sql'):
+    with open(f) as fh:
+        text = fh.read()
+    m = re.search(r';\s*\n(limit\s+\d+)\s*;', text)
+    if m:
+        lim = m.group(1)
+        text = re.sub(r';\s*\n' + re.escape(lim) + r'\s*;', '\n' + lim + ';', text)
+        with open(f, 'w') as fh:
+            fh.write(text)
+"
 fi
 
 echo "==> Done."

@@ -66,10 +66,16 @@ for i in $QUERIES; do
 
     echo "==> q$i"
     for iter in $(seq 1 "$ITERS"); do
-        native_ms=$(time_query main   "$qfile")
+        # Alternate execution order to neutralize cache warming bias:
+        # odd iterations run native first, even iterations run branch first.
+        if [ $((iter % 2)) -eq 1 ]; then
+            native_ms=$(time_query main   "$qfile")
+            branch_ms=$(time_query bench  "$qfile")
+        else
+            branch_ms=$(time_query bench  "$qfile")
+            native_ms=$(time_query main   "$qfile")
+        fi
         echo "q$i,native,$iter,$native_ms" >> "$RESULTS"
-
-        branch_ms=$(time_query bench  "$qfile")
         echo "q$i,branch,$iter,$branch_ms" >> "$RESULTS"
 
         printf "    iter %d: native=%sms branch=%sms\n" "$iter" "$native_ms" "$branch_ms"
@@ -98,3 +104,8 @@ for i in $QUERIES; do
         printf "%-6s %12s %12s %12s\n" "$q" "$nmed" "$bmed" "$ovh"
     fi
 done
+
+# Generate graphs
+echo ""
+echo "==> Generating graphs..."
+python3 "$HERE/graph.py" "$RESULTS"

@@ -20,3 +20,4 @@ bench/tpch/tpch-kit/
 bench/tpch/data/
 bench/tpch/queries/
 bench/tpch/results.csv
+bench/tpch/graphs/
