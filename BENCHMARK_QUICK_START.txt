@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Quick Reference Guide for Benchmarking
+#
+# This file documents the exact commands needed to run the full benchmark suite
+
+echo "
+╔════════════════════════════════════════════════════════════════════════╗
+║         PostgreSQL Branch Extension vs OrpheusDB Benchmarking         ║
+║                        Quick Reference Guide                          ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+## SETUP (One-Time)
+
+  cd /Users/dereky/Documents/School/SUGS/CSE584/CSE584-project/cse584-project/bench
+  ./setup_all.sh
+
+  This will:
+    ✓ Generate TPC-H data (if not present)
+    ✓ Setup branch extension benchmark
+    ✓ Setup OrpheusDB simulator benchmark
+    Takes: ~5-15 minutes (depends on disk speed)
+
+## RUN BENCHMARKS
+
+  Option A: Run sequentially (simplest)
+    cd bench/tpch
+    ./run.sh                          # Branch extension (5-15 min)
+    
+    cd ../orpheus_sim
+    ./run.sh                          # OrpheusDB simulator (5-15 min)
+
+  Option B: Run in parallel (faster)
+    cd bench/tpch && ./run.sh &
+    cd ../orpheus_sim && ./run.sh &
+    wait
+
+  Option C: Run subsets for quick testing
+    cd bench/tpch
+    QUERIES=\"1 6 14\" ITERS=1 ./run.sh    # 3 queries, 1 iter each (~2 min)
+    
+    cd ../orpheus_sim
+    QUERIES=\"1 6 14\" ITERS=1 ./run.sh
+
+## COMPARE RESULTS
+
+  cd bench
+  ./compare.sh
+
+  This produces:
+    - comparison_raw.csv     : Detailed per-query comparison
+    - comparison_summary.txt : Statistical analysis
+
+## INTERPRET RESULTS
+
+  View summary:
+    cat comparison_summary.txt
+
+  Detailed per-query comparison:
+    cat comparison_raw.csv
+
+  Custom analysis:
+    # Show which implementation is faster for each query
+    awk -F, 'NR>1 {
+      if (\$6+0 < \$7+0) 
+        printf \"Q%2s: Branch wins (%.1f%% vs %.1f%%)\\n\", \$1, \$6, \$7
+      else
+        printf \"Q%2s: Sim wins (%.1f%% vs %.1f%%)\\n\", \$1, \$6, \$7
+    }' comparison_raw.csv
+
+## CLEANUP & RESET
+
+  # Drop and recreate databases
+  dropdb postgres (or your DB name)
+  createdb postgres
+
+  # Or from PostgreSQL:
+  psql -c \"DROP SCHEMA IF EXISTS public, branch_work_bench CASCADE; CREATE SCHEMA public;\"
+
+## DIRECTORY STRUCTURE
+
+  bench/
+  ├── tpch/
+  │   ├── setup.sh              ← Generate TPC-H data
+  │   ├── schema.sql            ← Branch extension schema
+  │   ├── load.sql              ← Load data
+  │   ├── init_branch.sql       ← Initialize branches
+  │   ├── run.sh                ← Run benchmark
+  │   └── results.csv           ← Output
+  │
+  ├── orpheus_sim/
+  │   ├── setup.sh              ← Setup simulator
+  │   ├── schema.sql            ← OrpheusDB schema
+  │   ├── versioning_functions.sql
+  │   ├── load.sql              ← Load data
+  │   ├── init_sim.sql          ← Initialize versions
+  │   ├── run.sh                ← Run benchmark
+  │   └── results_sim.csv       ← Output
+  │
+  ├── setup_all.sh              ← One-command setup
+  ├── compare.sh                ← Result comparison
+  └── README.md                 ← Full documentation
+
+## TROUBLESHOOTING
+
+  Q: \"TPC-H data not found\"
+  A: cd bench/tpch && ./setup.sh
+
+  Q: \"Connection refused\"
+  A: Make sure PostgreSQL is running
+     pg_ctl -D /usr/local/var/postgres start
+
+  Q: \"Table already exists\"
+  A: Drop and recreate database
+     dropdb postgres && createdb postgres
+
+  Q: Benchmarks take too long
+  A: Use smaller dataset or fewer queries
+     cd bench/tpch && QUERIES=\"1\" ITERS=1 ./run.sh
+
+  Q: \"Permission denied\" on .sh files
+  A: chmod +x bench/*.sh bench/*/*.sh
+
+## PERFORMANCE TIPS
+
+  1. Close other applications (fewer distractions)
+  2. Run with SSD for faster data loading
+  3. Use larger ITERS for more stable results
+     ITERS=5 ./run.sh
+  4. Check PostgreSQL settings:
+     psql -c \"SHOW work_mem; SHOW shared_buffers;\"
+
+## DOCUMENTATION
+
+  Main guide:           bench/README.md
+  Branch extension:     bench/tpch/README.md
+  OrpheusDB simulator:  bench/orpheus_sim/README.md
+  Implementation:       ORPHEUS_IMPLEMENTATION.md (project root)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+COMPLETE WORKFLOW EXAMPLE:
+
+  # Step 1: Setup (first time only)
+  cd /Users/dereky/Documents/School/SUGS/CSE584/CSE584-project/cse584-project/bench
+  ./setup_all.sh
+
+  # Step 2: Run both benchmarks in parallel
+  cd tpch && ./run.sh &
+  cd ../orpheus_sim && ./run.sh &
+  wait
+
+  # Step 3: Compare results
+  cd .. && ./compare.sh
+
+  # Step 4: Interpret results
+  cat comparison_summary.txt
+  tail -20 comparison_raw.csv
+
+═══════════════════════════════════════════════════════════════════════════════
+"

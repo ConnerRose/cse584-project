@@ -21,3 +21,5 @@ bench/tpch/data/
 bench/tpch/queries/
 bench/tpch/results.csv
 bench/tpch/graphs/
+
+.venv/
