@@ -1,72 +1,122 @@
-# TPC-H Benchmark for the Branch Extension
+# TPC-H Benchmark Suite (MVCC vs Copy vs Branch)
 
-Measures the overhead of the branch layer by running the 22 TPC-H queries
-natively and through `branch.run()` on an empty child branch.
+This directory contains the benchmark used to show how far PostgreSQL MVCC
+can go for versioning, where it fails, and where the branch extension helps.
+
+The suite keeps a single benchmark table (`lineitem`) and compares three
+approaches:
+
+- `native` / `mvcc`: PostgreSQL base table via MVCC snapshot semantics
+- `copy`: full table copy baseline (`copy_baseline.lineitem`)
+- `branch`: branch extension working copy (`branch_work_bench.lineitem`)
 
 ## Prerequisites
 
-- A working PostgreSQL 17 install with the `branch` extension built and
-  installed (run `make && make install` from the repo root first).
-- `git`, `make`, `cc` on PATH.
-- ~5 GB free disk (1 GB raw `.tbl` files + ~3 GB in Postgres at SF=1).
+- PostgreSQL 17
+- extension built/installed from repo root: `make && make install`
+- tools on PATH: `git`, `make`, `cc`, `python3`
+- optional for charts: `pip install matplotlib`
+- disk: roughly 5+ GB free at SF=1
 
 ## Setup
 
 ```bash
 cd bench/tpch
 
-# 1. Clone tpch-kit, build dbgen/qgen, generate SF=1 data and queries.
-#    Override with: SF=0.1 ./setup.sh for a smaller quick-test run.
+# 1) Generate TPC-H data and queries (SF defaults to 1).
 ./setup.sh
 
-# 2. Create the schema, load the data, and install the branch extension.
+# 2) Create schema and load data.
 psql postgres -f schema.sql
 psql postgres -f load.sql
+
+# 3) Install extension + benchmark objects (branch + copy baselines).
 psql postgres -f init_branch.sql
 ```
 
-## Running the benchmark
+## What Each Script Does
+
+- `run.sh`:
+  - creation timing microbenchmark (`mvcc`, `copy`, `branch`)
+  - read benchmark over TPC-H query files (`native`, `copy`, `branch`)
+  - outputs:
+    - `creation_results.csv`
+    - `results.csv`
+- `run_all.sh`: one-command orchestrator for read/write/storage (+ optional wall tests)
+- `wall_tests.sql`: five MVCC limitation demonstrations (qualitative + helper stats)
+- `bench_write.sql`: write workload on sampled `lineitem` keys (1%/10% deltas)
+- `bench_storage.sql`: relation-size and dead-tuple metrics
+- `analyze_results.py`: plots charts and prints a LaTeX capability matrix
+
+## Running Benchmarks
+
+### 1) Creation + Read Benchmark
 
 ```bash
-./run.sh                    # all 22 queries, 3 iterations each
-ITERS=5 ./run.sh            # more iterations
-QUERIES="1 6 14" ./run.sh   # only specific queries
+# all queries, 3 iterations
+./run.sh
+
+# custom run
+ITERS=5 QUERIES="1 6 14" ./run.sh
 ```
 
-Results are written to `results.csv` (one row per query / mode / iteration)
-and a median-per-query summary is printed.
+Note: `run.sh` checks `SHOW autovacuum;` and exits unless it is `off`
+(or `ALLOW_AUTOVACUUM_ON=1` is set).
 
-## Benchmark design
+### Fast Path: Run Everything
 
-The `branches` metadata table ties each branch to a single `base_table`, so
-we can't cover all 8 TPC-H tables under one branch. We register `main` on
-**LINEITEM** (the biggest table at SF=1, ~6M rows) and create a child
-branch `bench`. Creating the child eagerly materializes a full copy of
-LINEITEM (with its PK and indexes) into schema `branch_work_bench`.
+```bash
+# includes run.sh + write benchmark + storage snapshot + figure generation
+./run_all.sh
 
-For each query we compare:
+# include wall tests too
+RUN_WALL_TESTS=1 ./run_all.sh
+```
 
-- **native** — `switch_branch('main')` then run the query. `search_path` is
-  `public`, so LINEITEM resolves to `public.lineitem`.
-- **branch** — `switch_branch('bench')` then run the same query.
-  `search_path` becomes `branch_work_bench, public`, so LINEITEM resolves
-  to the working copy while the other 7 tables still come from `public`.
+### 2) MVCC Wall Demonstrations
 
-Both runs execute the query inside
-`DO $$ BEGIN PERFORM 1 FROM (<query>) t; END $$;` so that rows are consumed
-server-side and result-transfer time is removed from the measurement.
+```bash
+psql postgres -f wall_tests.sql
+```
 
-The delta is the overhead of reading through a second, schema-resolved copy
-of LINEITEM with an empty delta log. Since the working copy has identical
-structure and indexes to `public.lineitem`, we expect the overhead to be
-near zero — any measurable gap comes from cold cache effects, stats
-differences, or planner choices on the cloned table.
+### 3) Write Benchmark
+
+```bash
+psql postgres -v mode=branch -v delta_pct=1  -f bench_write.sql
+psql postgres -v mode=copy   -v delta_pct=1  -f bench_write.sql
+psql postgres -v mode=mvcc   -v delta_pct=1  -f bench_write.sql
+
+psql postgres -v mode=branch -v delta_pct=10 -f bench_write.sql
+psql postgres -v mode=copy   -v delta_pct=10 -f bench_write.sql
+psql postgres -v mode=mvcc   -v delta_pct=10 -f bench_write.sql
+```
+
+### 4) Storage Snapshot
+
+```bash
+psql postgres -f bench_storage.sql
+```
+
+### 5) Generate Figures
+
+```bash
+python3 analyze_results.py
+```
+
+Figures are written to `figures/`.
+
+## Methodology Notes for Paper
+
+- Dataset: TPC-H `lineitem` (SF configurable; SF=1 ~6M rows)
+- Query timing uses server-side `\timing` and repeated runs
+- reported stats: median and standard deviation
+- `lineitem` has a composite PK (`l_orderkey`, `l_linenumber`)
+- branch benchmark does not rely on `apply_branch`; it focuses on branch
+  creation/switching/read/write/rollback behavior
 
 ## Caveats
 
-- Creating `bench` is a one-time ~several-second cost (clones LINEITEM +
-  indexes). This cost is not included in the per-query measurements.
-- The benchmark currently only exercises read overhead. Write overhead (the
-  cost of the AFTER ROW trigger appending deltas) is not measured here.
-- TPC-H Q15 creates and drops a view — it works, but `search_path` affects
-  where the view is created. Inspect `queries/q15.sql` if it misbehaves.
+- Q15 creates/drops a view and may be sensitive to `search_path`
+- Branch creation is eager snapshotting (`O(n)`), so creation-time comparisons
+  should be interpreted with semantic differences in mind (`mvcc` creation is
+  fast but does not provide persistent writable branching)

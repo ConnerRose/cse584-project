@@ -62,9 +62,15 @@ if ! ls "$QUERIES_DIR"/q*.sql >/dev/null 2>&1; then
     echo "==> Generating queries..."
     export DSS_QUERY="$DBGEN_DIR/queries"
     for i in $(seq 1 22); do
-        # Strip qgen cruft: leading "select"-prefix comment line and "limit -1"
+        # Strip qgen cruft: leading "select"-prefix comment line, "limit -1",
+        # and ANSI interval precision specifiers (e.g. "day (3)") that
+        # PostgreSQL does not support.
         (cd "$DBGEN_DIR" && ./qgen -s "$SF" "$i") \
-            | sed -e 's/limit -1//' -e 's/limit [0-9]\+/& /' \
+            | sed -e 's/limit -1//' \
+                  -e 's/limit [0-9][0-9]*//' \
+                  -e 's/day ([0-9]\+)/day/g' \
+                  -e 's/month ([0-9]\+)/month/g' \
+                  -e 's/year ([0-9]\+)/year/g' \
             > "$QUERIES_DIR/q$i.sql"
     done
 fi

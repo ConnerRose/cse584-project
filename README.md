@@ -1,6 +1,6 @@
 # Branch: Git-like Branching for PostgreSQL
 
-A PostgreSQL extension that adds branch-aware logical redo logging to relational tables. Create, switch, and query independent branches of your data without duplicating entire tables.
+A PostgreSQL extension that adds branch-aware logical redo logging to relational tables. Each branch is a **view** over the base table plus an append-only delta log (O(1) branch creation; storage grows with changes). Optional `materialize_branch()` upgrades a branch to a physical copy for maximum read throughput.
 
 ## Usage
 
@@ -23,7 +23,7 @@ VALUES ('main', NULL, 'users', NULL);
 SELECT branch.create_branch('experiment1', 'main');
 ```
 
-This creates a delta table (`branch.branch_delta_experiment1`) that records changes made on the branch without copying the base data.
+This creates a view in `branch_work_experiment1` and a delta table `branch.branch_delta_experiment1`. Writes on the branch are logged to the delta; the view reconstructs branch state without copying the base table up front.
 
 ### Switching Branches
 
@@ -42,15 +42,15 @@ SELECT branch.current_branch();
 ### Listing All Branches
 
 ```sql
-SELECT name, parent_id, base_table, delta_table, created_at
+SELECT name, parent_id, base_table, delta_table, materialized, created_at
 FROM branch.branches;
 ```
 
 ## Architecture
 
-### Delta Tables
+### View and delta tables
 
-Each branch has an associated delta table with the same schema as the base table plus two metadata columns:
+Each non-`main` branch has a view named like the base table in `branch_work_<name>` and an append-only delta table with the same schema as the base table plus two metadata columns:
 
 | Column | Description |
 |--------|-------------|
@@ -62,6 +62,6 @@ Each branch has an associated delta table with the same schema as the base table
 | File | Description |
 |------|-------------|
 | `src/branch.c` | C extension implementing `branch_create`, `branch_switch`, and `branch_current` via SPI and GUC |
-| `branch--0.1.sql` | SQL definitions: schema, metadata table, and function declarations |
+| `branch--0.2.sql` | SQL definitions: schema, metadata table, and function declarations |
 | `branch.control` | Extension metadata for PostgreSQL |
 | `Makefile` | PGXS-based build system |

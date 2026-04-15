@@ -1,0 +1,81 @@
+==> [1/4] creation + read benchmark
+creation iter 1: mvcc=0.302ms copy=16891.813ms branch=17179.201ms
+creation iter 2: mvcc=0.367ms copy=19545.727ms branch=21024.228ms
+creation iter 3: mvcc=0.239ms copy=17503.576ms branch=17102.632ms
+==> q1
+    iter 1: native=1145.141ms branch=2677.596ms copy=2679.054ms
+    iter 2: native=1145.464ms branch=2697.962ms copy=2678.783ms
+    iter 3: native=1148.144ms branch=2699.519ms copy=2683.750ms
+==> q2
+    iter 1: native=178.477ms branch=178.260ms copy=176.809ms
+    iter 2: native=180.045ms branch=165.759ms copy=162.907ms
+    iter 3: native=169.926ms branch=162.620ms copy=166.443ms
+==> q3
+    iter 1: native=258.109ms branch=352.299ms copy=330.429ms
+    iter 2: native=273.786ms branch=337.046ms copy=330.332ms
+    iter 3: native=272.464ms branch=345.675ms copy=332.062ms
+==> q4
+    iter 1: native=134.347ms branch=5041.104ms copy=4991.811ms
+    iter 2: native=193.643ms branch=5064.020ms copy=5037.154ms
+    iter 3: native=150.903ms branch=5084.234ms copy=5011.751ms
+==> q5
+    iter 1: native=151.361ms branch=334.965ms copy=311.752ms
+    iter 2: native=167.158ms branch=319.533ms copy=316.773ms
+    iter 3: native=167.775ms branch=366.215ms copy=313.433ms
+==> q6
+    iter 1: native=214.661ms branch=219.066ms copy=218.269ms
+    iter 2: native=219.866ms branch=219.674ms copy=216.640ms
+    iter 3: native=219.462ms branch=224.782ms copy=220.846ms
+==> q7
+    iter 1: native=223.090ms branch=390.347ms copy=381.533ms
+    iter 2: native=242.182ms branch=399.135ms copy=382.467ms
+    iter 3: native=242.299ms branch=405.321ms copy=385.708ms
+==> q8
+    iter 1: native=205.011ms branch=242.339ms copy=241.224ms
+    iter 2: native=223.210ms branch=242.960ms copy=241.809ms
+    iter 3: native=220.292ms branch=246.098ms copy=241.347ms
+==> q9
+    iter 1: native=912.728ms branch=852.449ms copy=840.512ms
+    iter 2: native=951.755ms branch=874.629ms copy=871.186ms
+    iter 3: native=945.110ms branch=860.870ms copy=843.689ms
+==> q10
+    iter 1: native=376.409ms branch=815.225ms copy=807.180ms
+    iter 2: native=400.536ms branch=878.411ms copy=814.597ms
+    iter 3: native=398.906ms branch=821.248ms copy=847.662ms
+==> q11
+    iter 1: native=68.694ms branch=68.235ms copy=67.437ms
+    iter 2: native=104.184ms branch=69.201ms copy=66.999ms
+    iter 3: native=68.624ms branch=69.194ms copy=68.737ms
+==> q12
+    iter 1: native=362.826ms branch=346.578ms copy=343.004ms
+    iter 2: native=363.969ms branch=348.909ms copy=345.636ms
+    iter 3: native=370.412ms branch=351.835ms copy=342.199ms
+==> q13
+    iter 1: native=367.452ms branch=363.398ms copy=361.108ms
+    iter 2: native=381.805ms branch=376.942ms copy=369.213ms
+    iter 3: native=389.716ms branch=369.750ms copy=368.062ms
+==> q14
+    iter 1: native=201.766ms branch=206.586ms copy=206.746ms
+    iter 2: native=207.426ms branch=210.589ms copy=208.848ms
+    iter 3: native=211.388ms branch=212.210ms copy=207.088ms
+==> q15
+    iter 1: native=431.586ms branch=463.829ms copy=444.382ms
+    iter 2: native=447.042ms branch=457.762ms copy=466.100ms
+    iter 3: native=446.343ms branch=457.775ms copy=446.389ms
+==> q16
+    iter 1: native=223.010ms branch=228.036ms copy=221.687ms
+    iter 2: native=225.085ms branch=222.815ms copy=224.725ms
+    iter 3: native=259.653ms branch=221.111ms copy=227.887ms
+==> q17
+    iter 1: native=17729225.968ms branch=9162035.969ms copy=3662869.862ms
+    iter 2: native=1935087.784ms branch=2102007.804ms copy=2136271.611ms
+    iter 3: native=1826099.664ms branch=1991659.076ms copy=2254421.618ms
+==> q18
+    iter 1: native=1420.804ms branch=2213.702ms copy=2180.764ms
+    iter 2: native=1421.100ms branch=2181.223ms copy=2185.152ms
+    iter 3: native=1425.603ms branch=2165.507ms copy=2188.777ms
+==> q19
+    iter 1: native=331.143ms branch=356.048ms copy=360.072ms
+    iter 2: native=331.226ms branch=357.098ms copy=362.425ms
+    iter 3: native=330.549ms branch=357.692ms copy=361.411ms
+==> q20

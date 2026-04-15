@@ -34,6 +34,8 @@ Connect to your database and run:
 CREATE EXTENSION branch;
 ```
 
+Extension version is **0.2** (view-based branches). If you previously installed **0.1** with eager copies, run `DROP EXTENSION branch CASCADE;` and `CREATE EXTENSION branch;` again after `make install`, then re-run your table setup scripts.
+
 ## Uninstall
 
 ```sql

@@ -20,6 +20,11 @@ bench/tpch/tpch-kit/
 bench/tpch/data/
 bench/tpch/queries/
 bench/tpch/results.csv
+bench/tpch/creation_results.csv
+bench/tpch/write_results.csv
+bench/tpch/storage_results.csv
+bench/tpch/multibranch_results.csv
+bench/tpch/figures/
 
 .cache/
 *.plan.md
