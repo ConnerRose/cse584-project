@@ -2,6 +2,10 @@
 -- Note: PARTSUPP and LINEITEM have composite primary keys — this is exactly
 -- what motivated composite-PK support in the branch extension.
 
+-- Drop views first (views must be dropped before their underlying tables)
+DROP VIEW IF EXISTS lineitem CASCADE;
+
+-- Drop tables
 DROP TABLE IF EXISTS lineitem, orders, partsupp, customer, supplier, part, nation, region CASCADE;
 
 CREATE TABLE region (

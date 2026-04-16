@@ -7,8 +7,12 @@
 -- The simulator focuses on LINEITEM (the largest TPC-H table at SF=1, ~6M rows)
 -- Other TPC-H tables (region, nation, part, supplier, etc.) are not versioned.
 
-DROP TABLE IF EXISTS lineitem, orders, partsupp, customer, supplier, part, nation, region CASCADE;
+-- Drop views first (if they exist from previous runs)
+DROP VIEW IF EXISTS lineitem CASCADE;
+
+-- Drop tables (use CASCADE to handle dependent views/indexes)
 DROP TABLE IF EXISTS lineitem_index, lineitem_data, lineitem_version CASCADE;
+DROP TABLE IF EXISTS orders, partsupp, customer, supplier, part, nation, region CASCADE;
 
 -- ============================================================================
 -- Standard TPC-H tables (non-versioned)
@@ -112,16 +116,7 @@ CREATE TABLE lineitem_data (
     l_comment          VARCHAR(44)    NOT NULL
 );
 
--- lineitem_index: maps record IDs to version IDs (many-to-many)
-CREATE TABLE lineitem_index (
-    rid                BIGINT       NOT NULL,
-    vid                INTEGER      NOT NULL,
-    PRIMARY KEY (rid, vid),
-    FOREIGN KEY (rid) REFERENCES lineitem_data(rid) ON DELETE CASCADE,
-    FOREIGN KEY (vid) REFERENCES lineitem_version(vid) ON DELETE CASCADE
-);
-
--- lineitem_version: metadata for each version
+-- lineitem_version: metadata for each version (must be created before lineitem_index due to FK)
 CREATE TABLE lineitem_version (
     vid                INTEGER      PRIMARY KEY,
     parent_vid         INTEGER      REFERENCES lineitem_version(vid) ON DELETE SET NULL,
@@ -131,23 +126,26 @@ CREATE TABLE lineitem_version (
     num_records        INTEGER      DEFAULT 0
 );
 
+-- lineitem_index: maps record IDs to version IDs (many-to-many)
+CREATE TABLE lineitem_index (
+    rid                BIGINT       NOT NULL,
+    vid                INTEGER      NOT NULL,
+    PRIMARY KEY (rid, vid),
+    FOREIGN KEY (rid) REFERENCES lineitem_data(rid) ON DELETE CASCADE,
+    FOREIGN KEY (vid) REFERENCES lineitem_version(vid) ON DELETE CASCADE
+);
+
 -- Create indexes for performance
 CREATE INDEX idx_lineitem_index_vid ON lineitem_index(vid);
 CREATE INDEX idx_lineitem_index_rid ON lineitem_index(rid);
 CREATE INDEX idx_lineitem_data_orderkey ON lineitem_data(l_orderkey);
 
--- ============================================================================
--- View: lineitem (used by queries)
--- Resolves to the current active version based on session state
--- ============================================================================
-
--- Temporary session table to track current version
-CREATE TEMP TABLE session_state (
-    current_vid INTEGER
-) ON COMMIT PRESERVE;
-
--- Initialize with version 0
+-- Initialize base version
 INSERT INTO lineitem_version (vid, author, commit_msg) VALUES (0, 'system', 'base');
+
+-- ============================================================================
+-- Session State and View Setup (must run in same session)
+-- ============================================================================
 
 -- Create a view that materializes the current version on demand
 -- This view is updated when switching versions
@@ -171,4 +169,14 @@ SELECT
     d.l_comment
 FROM lineitem_data d
 INNER JOIN lineitem_index i ON d.rid = i.rid
-WHERE i.vid = COALESCE((SELECT current_vid FROM session_state LIMIT 1), 0);
+WHERE i.vid = 0;
+-- ============================================================================
+-- Session State: Tracks active version per session
+-- ============================================================================
+-- This table is used by switch_version() to track which version is active
+-- in the current session. There should only be one row per active session.
+
+DROP TABLE IF EXISTS session_state CASCADE;
+CREATE TABLE session_state (
+    current_vid INTEGER NOT NULL DEFAULT 0
+);

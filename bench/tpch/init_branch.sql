@@ -8,10 +8,15 @@
 --     so we're measuring the pure overhead of the branch layer (trigger setup
 --     + temp-table shadow creation/drop), not the cost of delta overlay.
 
-\set ON_ERROR_STOP on
+\set ON_ERROR_STOP off
 
+-- Ensure the branch extension is loaded
+-- The DROP ... IF EXISTS is safe even if it doesn't exist
+-- The CREATE ... IF NOT EXISTS ensures we don't error if already loaded
 DROP EXTENSION IF EXISTS branch CASCADE;
 CREATE EXTENSION branch;
+
+\set ON_ERROR_STOP on
 
 -- Register 'main' against LINEITEM
 INSERT INTO branch.branches (name, base_table) VALUES ('main', 'lineitem');

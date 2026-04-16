@@ -31,17 +31,54 @@ This benchmark implements an **OrpheusDB-style table versioning system** in pure
 
 ## Setup
 
+The setup follows a **clean separation of concerns**, matching the tpch benchmark pipeline:
+
 ```bash
 cd bench/orpheus_sim
 
-# 1. Create schema, load data, initialize versions
+# 1. Ensure TPC-H data exists
 ./setup.sh
+# This runs tpch/setup.sh if needed, then shows next steps
 
-# 2. Verify installation
-psql -c "SELECT * FROM list_versions();" postgres
+# 2. Create orpheus_sim schema (defines versioning tables)
+psql postgres -f schema.sql
 
-# 3. Check record counts
-psql -c "SELECT vid, num_records FROM lineitem_version;" postgres
+# 3. Load TPC-H data into versioned tables
+./load.sh
+# Copies .tbl files to /tmp, substitutes path, and loads
+
+# 4. Initialize versioning (create child version)
+psql postgres -f init_sim.sql
+
+# 5. Run benchmark
+./run.sh
+```
+
+### Why This Pipeline?
+
+Following tpch's design avoids complex orchestration and makes debugging easier:
+
+| Step | Script | Purpose |
+|------|--------|---------|
+| 1 | `setup.sh` | Ensures TPC-H data exists (data layer) |
+| 2 | `schema.sql` | Creates orpheus_sim tables (schema layer) |
+| 3 | `load.sh` | Loads data with path substitution (data loading layer) |
+| 4 | `init_sim.sql` | Initializes versioning (business logic layer) |
+| 5 | `run.sh` | Runs benchmark (testing layer) |
+
+Each step is **independently testable** and can be run in any database.
+
+### Verification
+
+```bash
+# Check versions created
+psql -c "SELECT * FROM lineitem_version;" postgres
+
+# Check lineitem view resolves correctly
+psql -c "SELECT COUNT(*) FROM lineitem;" postgres
+
+# Check record counts match TPC-H scale factor
+psql -c "SELECT l_returnflag, l_linestatus, COUNT(*) FROM lineitem GROUP BY 1,2;" postgres
 ```
 
 ## Running the Benchmark

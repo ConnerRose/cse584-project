@@ -69,4 +69,28 @@ for i in $QUERIES; do
 done
 
 echo ""
-echo "==> Results written to $RESULTS"
+echo "==> Results written to $RESULTS"echo ""
+
+# Summary — median per (query, mode), using sort instead of gawk asort
+echo "Summary (median ms per query):"
+printf "%-6s %12s %12s %12s\n" "query" "native" "sim" "overhead"
+for i in $QUERIES; do
+    q="q$i"
+    nmed=$(awk -F, -v q="$q" '$1==q && $2=="native" { print $4 }' "$RESULTS" \
+           | grep -v NaN | sort -n \
+           | awk '{a[NR]=$0} END{ if (NR>0) print a[int((NR+1)/2)] }')
+    smed=$(awk -F, -v q="$q" '$1==q && $2=="sim" { print $4 }' "$RESULTS" \
+           | grep -v NaN | sort -n \
+           | awk '{a[NR]=$0} END{ if (NR>0) print a[int((NR+1)/2)] }')
+    if [ -z "$nmed" ] || [ -z "$smed" ]; then
+        printf "%-6s %12s %12s %12s\n" "$q" "${nmed:-NaN}" "${smed:-NaN}" "n/a"
+    else
+        ovh=$(awk -v n="$nmed" -v s="$smed" 'BEGIN { if (n>0) printf "%.2fx", s/n; else print "n/a" }')
+        printf "%-6s %12s %12s %12s\n" "$q" "$nmed" "$smed" "$ovh"
+    fi
+done
+
+# Generate graphs
+echo ""
+echo "==> Generating graphs..."
+python3 "$HERE/graph.py" "$RESULTS"
