@@ -21,3 +21,7 @@ bench/tpch/data/
 bench/tpch/queries/
 bench/tpch/results.csv
 bench/tpch/graphs/
+
+# Delta scaling benchmark artifacts
+bench/delta_scaling/results.csv
+bench/delta_scaling/graphs/

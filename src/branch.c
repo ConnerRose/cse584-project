@@ -99,6 +99,9 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   char* new_columns;
   char* old_columns;
   char* pk_cols;
+  char* pk_join_cond;  /* e.g. "base.id = d.id AND base.x = d.x" */
+  char* pk_first_col;  /* e.g. "id" — for IS NULL check */
+  char* base_columns;  /* e.g. "base.id, base.name" */
 
   SPI_connect();
 
@@ -166,6 +169,8 @@ Datum branch_create(PG_FUNCTION_ARGS) {
       "  string_agg('NEW.' || quote_ident(column_name), ', ' "
       "             ORDER BY ordinal_position), "
       "  string_agg('OLD.' || quote_ident(column_name), ', ' "
+      "             ORDER BY ordinal_position), "
+      "  string_agg('base.' || quote_ident(column_name), ', ' "
       "             ORDER BY ordinal_position) "
       "FROM information_schema.columns "
       "WHERE table_name = %s AND table_schema = 'public'",
@@ -182,13 +187,20 @@ Datum branch_create(PG_FUNCTION_ARGS) {
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2));
   old_columns =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3));
+  base_columns =
+      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4));
 
-  /* Get PK columns */
+  /* Get PK columns and join condition */
   resetStringInfo(&buf);
   appendStringInfo(
       &buf,
       "SELECT string_agg(quote_ident(a.attname), ', ' "
-      "  ORDER BY array_position(i.indkey::int[], a.attnum::int)) "
+      "  ORDER BY array_position(i.indkey::int[], a.attnum::int)), "
+      "string_agg('base.' || quote_ident(a.attname) || ' = d.' || "
+      "  quote_ident(a.attname), ' AND ' "
+      "  ORDER BY array_position(i.indkey::int[], a.attnum::int)), "
+      "(array_agg(quote_ident(a.attname) "
+      "  ORDER BY array_position(i.indkey::int[], a.attnum::int)))[1] "
       "FROM pg_index i "
       "JOIN pg_attribute a ON a.attrelid = i.indrelid "
       "AND a.attnum = ANY(i.indkey) "
@@ -202,28 +214,44 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   }
   {
     char* pk_val = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+    char* join_val = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+    char* first_val = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
     if (pk_val == NULL) {
       ereport(ERROR, (errmsg("table \"%s\" has no primary key", base_table)));
     }
     pk_cols = pstrdup(pk_val);
+    pk_join_cond = pstrdup(join_val);
+    pk_first_col = pstrdup(first_val);
   }
 
-  /* 3. Create the overlay view */
+  /* 3. Create the overlay view (LEFT JOIN anti-join for parallelism) */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "CREATE VIEW %s.%s AS "
-                   "WITH latest AS ("
+                   "SELECT %s FROM %s base "
+                   "LEFT JOIN ("
+                   "  SELECT DISTINCT ON (%s) %s "
+                   "  FROM branch.%s "
+                   "  ORDER BY %s, _seq DESC"
+                   ") d ON %s "
+                   "WHERE d.%s IS NULL "
+                   "UNION ALL "
+                   "SELECT %s FROM ("
                    "  SELECT DISTINCT ON (%s) _op, %s "
                    "  FROM branch.%s "
                    "  ORDER BY %s, _seq DESC"
-                   ") "
-                   "SELECT %s FROM %s "
-                   "WHERE (%s) NOT IN (SELECT %s FROM latest) "
-                   "UNION ALL "
-                   "SELECT %s FROM latest WHERE _op IN ('I','U')",
+                   ") d2 WHERE d2._op IN ('I','U')",
+                   /* CREATE VIEW <schema>.<table> AS */
                    quote_identifier(work_schema), quote_identifier(base_table),
-                   pk_cols, columns, quote_identifier(delta_table), pk_cols,
-                   columns, parent_source, pk_cols, pk_cols, columns);
+                   /* SELECT <base.cols> FROM <parent> base */
+                   base_columns, parent_source,
+                   /* LEFT JOIN (SELECT DISTINCT ON (<pk>) <pk> FROM <delta> ORDER BY <pk>, _seq DESC) d */
+                   pk_cols, pk_cols, quote_identifier(delta_table), pk_cols,
+                   /* ON <join_cond> WHERE d.<first_pk> IS NULL */
+                   pk_join_cond, pk_first_col,
+                   /* UNION ALL SELECT <cols> FROM (SELECT DISTINCT ON (<pk>) ... FROM <delta>) d2 WHERE ... */
+                   columns,
+                   pk_cols, columns, quote_identifier(delta_table), pk_cols);
   ret = SPI_execute(buf.data, false, 0);
   if (ret != SPI_OK_UTILITY) {
     ereport(ERROR,
