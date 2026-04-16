@@ -1,12 +1,11 @@
 -- Install the branch extension and set up the benchmark branch.
 --
 -- Design:
---   - The branches table allows one base_table per branch. We register
---     'main' on LINEITEM (the largest table at ~6M rows SF=1) so every
---     branch.run() call exercises the most expensive shadow-materialization.
---   - 'bench' is an empty child branch used for the benchmark run — no deltas,
---     so we're measuring the pure overhead of the branch layer (trigger setup
---     + temp-table shadow creation/drop), not the cost of delta overlay.
+--   - Register 'main' on LINEITEM (the largest table at ~6M rows SF=1).
+--   - 'bench' is an empty child branch — a VIEW overlaying an empty delta
+--     table on public.lineitem. With no deltas, the view resolves to the
+--     base table, so we're measuring the pure overhead of the branch layer
+--     (view resolution + UNION ALL with empty delta), not delta replay cost.
 
 \set ON_ERROR_STOP on
 
