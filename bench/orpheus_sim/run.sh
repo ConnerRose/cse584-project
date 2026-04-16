@@ -34,8 +34,8 @@ time_query() {
     local qfile="$2"
     local out rc
     out=$(psql -q -X -A -t -v ON_ERROR_STOP=1 "$DB" 2>&1 <<EOF
-SELECT switch_version($vid);
 \timing on
+SELECT switch_version($vid);
 \i $qfile
 EOF
 )
