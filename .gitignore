@@ -15,16 +15,23 @@ regression.out
 # Editor/IDE
 .clangd
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
 # TPC-H benchmark artifacts
 bench/tpch/tpch-kit/
 bench/tpch/data/
 bench/tpch/queries/
-bench/tpch/results.csv
-bench/tpch/creation_results.csv
-bench/tpch/write_results.csv
-bench/tpch/storage_results.csv
-bench/tpch/multibranch_results.csv
+bench/tpch/*.csv
 bench/tpch/figures/
+
+# Generated sci / version-graph datasets (regenerate locally)
+sci_data/
+sci_data_v1/
 
 .cache/
 *.plan.md
+
+.venv/

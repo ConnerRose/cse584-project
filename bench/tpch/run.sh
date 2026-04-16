@@ -16,8 +16,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 QUERIES_DIR="$HERE/queries"
-RESULTS="$HERE/results.csv"
-CREATION_RESULTS="$HERE/creation_results.csv"
+RESULTS="${RESULTS:-$HERE/results.csv}"
+CREATION_RESULTS="${CREATION_RESULTS:-$HERE/creation_results.csv}"
 
 DB="${DB:-postgres}"
 ITERS="${ITERS:-3}"
@@ -155,6 +155,7 @@ EOF
 DROP SCHEMA IF EXISTS branch_work_bench CASCADE;
 DROP TABLE IF EXISTS branch.branch_delta_bench;
 DROP FUNCTION IF EXISTS branch._capture_bench() CASCADE;
+DROP FUNCTION IF EXISTS branch._lazy_bench() CASCADE;
 DELETE FROM branch.branches WHERE name = 'bench';
 \timing on
 SELECT branch.create_branch('bench', 'main');
@@ -180,6 +181,27 @@ for iter in $(seq 1 "$ITERS"); do
     echo "branch,$iter,$branch_ms" >> "$CREATION_RESULTS"
     printf "creation iter %d: mvcc=%sms copy=%sms branch=%sms\n" "$iter" "$mvcc_ms" "$copy_ms" "$branch_ms"
 done
+
+# After the creation benchmark the bench branch exists but its working copy is
+# empty (lazy copy-on-first-write).  Materialize it now so read queries see real
+# data, then analyze so the planner has accurate stats.
+echo "==> materializing bench branch for read queries..."
+psql -q -X -v ON_ERROR_STOP=1 "$DB" <<'MATERIALIZE_EOF'
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM branch_work_bench.lineitem LIMIT 1) THEN
+        -- Disable both triggers before INSERT so neither fires mid-copy.
+        ALTER TABLE branch_work_bench.lineitem DISABLE TRIGGER _lazy_materialize;
+        ALTER TABLE branch_work_bench.lineitem DISABLE TRIGGER _capture;
+        INSERT INTO branch_work_bench.lineitem SELECT * FROM public.lineitem;
+        ALTER TABLE branch_work_bench.lineitem ENABLE TRIGGER _capture;
+        ALTER TABLE branch_work_bench.lineitem ENABLE TRIGGER _lazy_materialize;
+        UPDATE branch.branches SET materialized = true WHERE name = 'bench';
+    END IF;
+END;
+$$;
+ANALYZE branch_work_bench.lineitem;
+MATERIALIZE_EOF
 
 echo "query,mode,iter,ms" > "$RESULTS"
 

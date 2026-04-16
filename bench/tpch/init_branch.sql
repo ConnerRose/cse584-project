@@ -40,6 +40,8 @@ CREATE TABLE copy_baseline.lineitem (LIKE public.lineitem INCLUDING ALL);
 INSERT INTO copy_baseline.lineitem SELECT * FROM public.lineitem;
 
 ANALYZE copy_baseline.lineitem;
+-- branch_work_bench.lineitem starts empty (lazy copy-on-first-write);
+-- call branch.materialize_branch('bench') before read benchmarks if needed.
 ANALYZE branch.branch_delta_bench;
 
 -- Small metadata table used by wall tests to persist timestamps/notes.

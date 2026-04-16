@@ -27,7 +27,7 @@ DROP TABLE IF EXISTS bench_keys;
 CREATE TEMP TABLE bench_keys AS
 SELECT l_orderkey, l_linenumber
 FROM public.lineitem
-WHERE l_orderkey % 100 < :delta_pct;
+WHERE abs(hashtext(l_orderkey::text || l_linenumber::text)) % 100 < :delta_pct;
 
 \echo 'mode=' :mode ', delta_pct=' :delta_pct
 SELECT count(*) AS key_count FROM bench_keys;

@@ -8,9 +8,6 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 
-#include <ctype.h>
-#include <string.h>
-
 PG_MODULE_MAGIC;
 
 /* GUC variable: the currently active branch name */
@@ -64,82 +61,17 @@ static char* lookup_base_table(const char* branch_name) {
   return result;
 }
 
-/*
- * Build "d.col = b.col AND ..." from a comma-separated pk column list.
- * Both sides use the same bare identifiers (already safe from the catalog).
- */
-static char* build_pk_join_two_aliases(const char* pk_cols_raw,
-                                       const char* alias_a,
-                                       const char* alias_b) {
-  StringInfoData out;
-  char* copy;
-  char* saveptr = NULL;
-  char* token;
-  char* end;
-  bool first = true;
-
-  initStringInfo(&out);
-  copy = pstrdup(pk_cols_raw);
-
-  for (token = strtok_r(copy, ",", &saveptr); token != NULL;
-       token = strtok_r(NULL, ",", &saveptr)) {
-    while (*token == ' ') {
-      token++;
-    }
-    end = token + strlen(token);
-    while (end > token && isspace((unsigned char)end[-1])) {
-      end--;
-    }
-    *end = '\0';
-
-    if (!first) {
-      appendStringInfoString(&out, " AND ");
-    }
-    first = false;
-    appendStringInfo(&out, "%s.%s = %s.%s", alias_a, token, alias_b, token);
-  }
-
-  pfree(copy);
-  return out.data;
-}
-
-static char* lookup_primary_key_columns(const char* base_table) {
-  StringInfoData buf;
-  int ret;
-  char* pk;
-
-  initStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "SELECT string_agg(quote_ident(a.attname), ', ' "
-      "  ORDER BY array_position(i.indkey::int[], a.attnum::int)) "
-      "FROM pg_index i "
-      "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-      "AND a.attnum = ANY(i.indkey) "
-      "WHERE i.indrelid = 'public.%s'::regclass AND i.indisprimary",
-      base_table);
-
-  ret = SPI_execute(buf.data, true, 1);
-  pfree(buf.data);
-  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
-    ereport(ERROR,
-            (errmsg("could not determine primary key for \"%s\"", base_table)));
-  }
-
-  pk = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-  if (pk == NULL) {
-    ereport(ERROR, (errmsg("table \"%s\" has no primary key", base_table)));
-  }
-  return pstrdup(pk);
-}
-
 /* ----------------------------------------------------------------
  * branch_create(new_branch TEXT, from_branch TEXT)
  *
- * Creates a view-based branch:
- *   1) work schema + delta table
- *   2) VIEW = parent rows minus (D,U) in latest delta, union I/U rows
- *   3) INSTEAD OF triggers log writes to the delta table
+ * Creates a new branch by:
+ *   1. Creating a per-branch "work schema" (branch_work_<name>)
+ *   2. Cloning the base table's structure (and indexes) into the work schema
+ *   3. Populating it from the parent branch's current state
+ *   4. Creating a delta table for the audit log
+ *   5. Installing an AFTER ROW trigger on the working copy that appends
+ *      row-level writes to the delta table
+ *   6. Registering the branch in branch.branches
  * ----------------------------------------------------------------
  */
 PG_FUNCTION_INFO_V1(branch_create);
@@ -162,8 +94,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   char* columns;
   char* new_columns;
   char* old_columns;
-  char* pk_cols;
-  char* pk_join_db;
 
   SPI_connect();
 
@@ -204,7 +134,22 @@ Datum branch_create(PG_FUNCTION_ARGS) {
             (errmsg("failed to create work schema \"%s\"", work_schema)));
   }
 
-  /* 2. Delta table (append-only audit log) */
+  /* 2. Clone the base table's structure (includes PK and other indexes) */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf,
+                   "CREATE TABLE %s.%s (LIKE public.%s INCLUDING ALL)",
+                   quote_identifier(work_schema), quote_identifier(base_table),
+                   quote_identifier(base_table));
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UTILITY) {
+    ereport(ERROR,
+            (errmsg("failed to create working copy of \"%s\"", base_table)));
+  }
+
+  /* 3. (Deferred) Working copy starts empty; data is copied lazily on first
+   *    write via the _lazy_<name> BEFORE STATEMENT trigger installed below. */
+
+  /* 4. Create the delta table (append-only audit log) */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "CREATE TABLE branch.%s ("
@@ -219,7 +164,7 @@ Datum branch_create(PG_FUNCTION_ARGS) {
                            new_branch)));
   }
 
-  /* Column lists + primary key (for view and index) */
+  /* Build column lists for the trigger function body */
   resetStringInfo(&buf);
   appendStringInfo(
       &buf,
@@ -246,64 +191,19 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   old_columns =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3));
 
-  pk_cols = lookup_primary_key_columns(base_table);
-  pk_join_db = build_pk_join_two_aliases(pk_cols, "d", "b");
-
-  /* Index to speed DISTINCT ON / joins on delta */
-  resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "CREATE INDEX ON branch.%s (%s, _seq DESC)",
-                   quote_identifier(delta_table), pk_cols);
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR,
-            (errmsg("failed to create index on delta for branch \"%s\"",
-                    new_branch)));
-  }
-
-  /* 3. VIEW: latest delta per PK; union visible rows */
-  resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "CREATE VIEW %s.%s AS "
-                   "WITH latest AS ( "
-                   "  SELECT DISTINCT ON (%s) "
-                   "    _op, %s "
-                   "  FROM branch.%s "
-                   "  ORDER BY %s, _seq DESC "
-                   ") "
-                   "SELECT %s "
-                   "FROM %s.%s b "
-                   "WHERE NOT EXISTS ( "
-                   "  SELECT 1 FROM latest d "
-                   "  WHERE (%s) AND d._op IN ('D','U') "
-                   ") "
-                   "UNION ALL "
-                   "SELECT %s FROM latest WHERE _op IN ('I','U')",
-                   quote_identifier(work_schema), quote_identifier(base_table),
-                   pk_cols, columns, quote_identifier(delta_table), pk_cols,
-                   columns, quote_identifier(parent_schema),
-                   quote_identifier(base_table), pk_join_db, columns);
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR, (errmsg("failed to create branch view for \"%s\"",
-                            new_branch)));
-  }
-
-  /* 4a. INSTEAD OF trigger: log to delta; RETURN values required */
+  /* 5a. Create the per-branch trigger function */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "CREATE FUNCTION branch.%s() RETURNS TRIGGER AS $fn$ "
                    "BEGIN "
                    "  IF TG_OP = 'INSERT' THEN "
                    "    INSERT INTO branch.%s (_op, %s) VALUES ('I', %s); "
-                   "    RETURN NEW; "
                    "  ELSIF TG_OP = 'DELETE' THEN "
                    "    INSERT INTO branch.%s (_op, %s) VALUES ('D', %s); "
-                   "    RETURN OLD; "
                    "  ELSE "
                    "    INSERT INTO branch.%s (_op, %s) VALUES ('U', %s); "
-                   "    RETURN NEW; "
                    "  END IF; "
+                   "  RETURN NULL; "
                    "END; "
                    "$fn$ LANGUAGE plpgsql",
                    quote_identifier(fn_name), quote_identifier(delta_table),
@@ -317,11 +217,11 @@ Datum branch_create(PG_FUNCTION_ARGS) {
                            new_branch)));
   }
 
-  /* 4b. INSTEAD OF on the view */
+  /* 5b. Install the AFTER ROW trigger on the working copy */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "CREATE TRIGGER _capture "
-                   "INSTEAD OF INSERT OR UPDATE OR DELETE ON %s.%s "
+                   "AFTER INSERT OR UPDATE OR DELETE ON %s.%s "
                    "FOR EACH ROW EXECUTE FUNCTION branch.%s()",
                    quote_identifier(work_schema), quote_identifier(base_table),
                    quote_identifier(fn_name));
@@ -331,12 +231,72 @@ Datum branch_create(PG_FUNCTION_ARGS) {
                            work_schema, base_table)));
   }
 
-  /* 5. Register branch (view-based, not materialized) */
+  {
+    /*
+     * 5c. Create a BEFORE STATEMENT lazy-materialization trigger.
+     *
+     * The working copy starts empty.  On the first write the trigger:
+     *   1. Disables _capture so the bulk copy is not logged as deltas.
+     *   2. Copies all rows from the parent into the working copy.
+     *   3. Re-enables _capture.
+     *   4. Marks the branch as materialized so subsequent writes skip this.
+     *
+     * The trigger stays installed but becomes a near-zero-cost check
+     * (single boolean lookup) after the first write.
+     */
+    char* lazy_fn_name = psprintf("_lazy_%s", new_branch);
+
+    resetStringInfo(&buf);
+    appendStringInfo(
+        &buf,
+        "CREATE FUNCTION branch.%s() RETURNS TRIGGER AS $fn$ "
+        "BEGIN "
+        "  IF NOT (SELECT materialized FROM branch.branches WHERE name = %s) THEN "
+        "    EXECUTE 'ALTER TABLE %s.%s DISABLE TRIGGER _capture'; "
+        "    INSERT INTO %s.%s SELECT * FROM %s.%s; "
+        "    EXECUTE 'ALTER TABLE %s.%s ENABLE TRIGGER _capture'; "
+        "    UPDATE branch.branches SET materialized = true WHERE name = %s; "
+        "  END IF; "
+        "  RETURN NULL; "
+        "END; "
+        "$fn$ LANGUAGE plpgsql",
+        quote_identifier(lazy_fn_name),
+        quote_literal_cstr(new_branch),
+        /* DISABLE TRIGGER identifiers (embedded as SQL text in EXECUTE string) */
+        work_schema, base_table,
+        /* INSERT INTO work copy from parent */
+        quote_identifier(work_schema), quote_identifier(base_table),
+        quote_identifier(parent_schema), quote_identifier(base_table),
+        /* ENABLE TRIGGER identifiers */
+        work_schema, base_table,
+        quote_literal_cstr(new_branch));
+    ret = SPI_execute(buf.data, false, 0);
+    if (ret != SPI_OK_UTILITY) {
+      ereport(ERROR, (errmsg("failed to create lazy trigger function for "
+                             "branch \"%s\"",
+                             new_branch)));
+    }
+
+    resetStringInfo(&buf);
+    appendStringInfo(&buf,
+                     "CREATE TRIGGER _lazy_materialize "
+                     "BEFORE INSERT OR UPDATE OR DELETE ON %s.%s "
+                     "FOR EACH STATEMENT EXECUTE FUNCTION branch.%s()",
+                     quote_identifier(work_schema), quote_identifier(base_table),
+                     quote_identifier(lazy_fn_name));
+    ret = SPI_execute(buf.data, false, 0);
+    if (ret != SPI_OK_UTILITY) {
+      ereport(ERROR, (errmsg("failed to install lazy trigger on \"%s.%s\"",
+                             work_schema, base_table)));
+    }
+  }
+
+  /* 6. Register the branch (materialized defaults to false) */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "INSERT INTO branch.branches (name, parent_id, "
-                   "base_table, delta_table, materialized) "
-                   "VALUES (%s, %d, %s, %s, false)",
+                   "base_table, delta_table) "
+                   "VALUES (%s, %d, %s, %s)",
                    quote_literal_cstr(new_branch), parent_id,
                    quote_literal_cstr(base_table),
                    quote_literal_cstr(delta_table));
@@ -345,13 +305,9 @@ Datum branch_create(PG_FUNCTION_ARGS) {
     ereport(ERROR, (errmsg("failed to register branch \"%s\"", new_branch)));
   }
 
-  pfree(pk_join_db);
-  pfree(pk_cols);
-
   SPI_finish();
 
-  elog(NOTICE, "branch \"%s\" created from \"%s\" (view-based)", new_branch,
-       from_branch);
+  elog(NOTICE, "branch \"%s\" created from \"%s\"", new_branch, from_branch);
   PG_RETURN_VOID();
 }
 
@@ -574,9 +530,10 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
 /* ----------------------------------------------------------------
  * branch_rollback(branch_name TEXT)
  *
- * View branch: TRUNCATE delta only (view then matches parent).
- * Materialized branch: truncate physical table, refill from parent,
- * then truncate delta (trigger disabled during refill).
+ * Discards all changes on the branch. Re-materializes the working copy
+ * from the parent's current state and truncates the delta table.
+ * The capture trigger is disabled during the re-populate so that the
+ * refresh doesn't spuriously log inserts.
  * ----------------------------------------------------------------
  */
 PG_FUNCTION_INFO_V1(branch_rollback);
@@ -593,14 +550,13 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
   char* parent_schema;
   char* work_schema;
   bool isnull;
-  bool materialized;
-  Datum mat_datum;
 
   SPI_connect();
 
+  /* Look up this branch's metadata and its parent's name */
   initStringInfo(&buf);
   appendStringInfo(&buf,
-                   "SELECT b.base_table, b.delta_table, b.materialized, p.name "
+                   "SELECT b.base_table, b.delta_table, p.name "
                    "FROM branch.branches b "
                    "JOIN branch.branches p ON p.branch_id = b.parent_id "
                    "WHERE b.name = %s",
@@ -616,10 +572,8 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
   base_table =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
   delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
-  mat_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3,
-                            &isnull);
-  materialized = (!isnull) && DatumGetBool(mat_datum);
-  parent_name = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
+  parent_name = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+  (void)isnull;
 
   if (delta_table == NULL) {
     ereport(ERROR, (errmsg("branch \"%s\" has no delta table (is it main?)",
@@ -635,21 +589,7 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
   }
   work_schema = work_schema_name(branch_name);
 
-  if (!materialized) {
-    resetStringInfo(&buf);
-    appendStringInfo(&buf, "TRUNCATE branch.%s", quote_identifier(delta_table));
-    ret = SPI_execute(buf.data, false, 0);
-    if (ret != SPI_OK_UTILITY) {
-      ereport(ERROR,
-              (errmsg("failed to truncate delta table for branch \"%s\"",
-                      branch_name)));
-    }
-    SPI_finish();
-    elog(NOTICE, "rolled back view branch \"%s\" (delta cleared)", branch_name);
-    PG_RETURN_VOID();
-  }
-
-  /* Materialized: refresh physical table from parent */
+  /* Disable capture trigger on working copy so the refresh doesn't re-log */
   resetStringInfo(&buf);
   appendStringInfo(&buf, "ALTER TABLE %s.%s DISABLE TRIGGER _capture",
                    quote_identifier(work_schema), quote_identifier(base_table));
@@ -658,6 +598,7 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
     ereport(ERROR, (errmsg("failed to disable capture trigger")));
   }
 
+  /* Wipe the working copy */
   resetStringInfo(&buf);
   appendStringInfo(&buf, "TRUNCATE %s.%s", quote_identifier(work_schema),
                    quote_identifier(base_table));
@@ -666,6 +607,7 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
     ereport(ERROR, (errmsg("failed to truncate working copy")));
   }
 
+  /* Repopulate from parent's current state */
   resetStringInfo(&buf);
   appendStringInfo(&buf, "INSERT INTO %s.%s SELECT * FROM %s.%s",
                    quote_identifier(work_schema), quote_identifier(base_table),
@@ -676,6 +618,7 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
     ereport(ERROR, (errmsg("failed to repopulate working copy from parent")));
   }
 
+  /* Re-enable trigger */
   resetStringInfo(&buf);
   appendStringInfo(&buf, "ALTER TABLE %s.%s ENABLE TRIGGER _capture",
                    quote_identifier(work_schema), quote_identifier(base_table));
@@ -684,6 +627,18 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
     ereport(ERROR, (errmsg("failed to re-enable capture trigger")));
   }
 
+  /* Mark the branch as materialized — rollback always produces a full copy */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf,
+                   "UPDATE branch.branches SET materialized = true WHERE name = %s",
+                   quote_literal_cstr(branch_name));
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UPDATE) {
+    ereport(ERROR, (errmsg("failed to mark branch \"%s\" as materialized",
+                           branch_name)));
+  }
+
+  /* Clear the delta log */
   resetStringInfo(&buf);
   appendStringInfo(&buf, "TRUNCATE branch.%s", quote_identifier(delta_table));
   ret = SPI_execute(buf.data, false, 0);
@@ -694,194 +649,16 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
 
   SPI_finish();
 
-  elog(NOTICE, "rolled back materialized branch \"%s\"", branch_name);
-  PG_RETURN_VOID();
-}
-
-/* ----------------------------------------------------------------
- * branch_materialize(branch_name TEXT)
- *
- * Copies the branch view into a physical table, replaces the view,
- * switches to AFTER ROW capture + RETURN NULL, sets materialized.
- * ----------------------------------------------------------------
- */
-PG_FUNCTION_INFO_V1(branch_materialize);
-
-Datum branch_materialize(PG_FUNCTION_ARGS) {
-  text* branch_name_t = PG_GETARG_TEXT_PP(0);
-  char* branch_name = text_to_cstring(branch_name_t);
-
-  int ret;
-  StringInfoData buf;
-  char* base_table;
-  char* delta_table;
-  char* fn_name;
-  char* work_schema;
-  char* mat_table;
-  char* columns;
-  char* new_columns;
-  char* old_columns;
-  bool isnull;
-  Datum mat_datum;
-
-  SPI_connect();
-
-  initStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "SELECT base_table, delta_table, materialized FROM branch.branches "
-      "WHERE name = %s",
-      quote_literal_cstr(branch_name));
-
-  ret = SPI_execute(buf.data, true, 1);
-  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
-    ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
-                    errmsg("branch \"%s\" does not exist", branch_name)));
-  }
-
-  base_table =
-      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
-  delta_table = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
-  mat_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3,
-                            &isnull);
-  if ((!isnull) && DatumGetBool(mat_datum)) {
-    ereport(ERROR,
-            (errmsg("branch \"%s\" is already materialized", branch_name)));
-  }
-
-  if (delta_table == NULL) {
-    ereport(ERROR, (errmsg("branch \"%s\" has no delta table", branch_name)));
-  }
-  delta_table = pstrdup(delta_table);
-  work_schema = work_schema_name(branch_name);
-  fn_name = trigger_fn_name(branch_name);
-  mat_table = psprintf("_branch_mat_%s", branch_name);
-
-  resetStringInfo(&buf);
-  appendStringInfo(
-      &buf,
-      "SELECT "
-      "  string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position), "
-      "  string_agg('NEW.' || quote_ident(column_name), ', ' "
-      "             ORDER BY ordinal_position), "
-      "  string_agg('OLD.' || quote_ident(column_name), ', ' "
-      "             ORDER BY ordinal_position) "
-      "FROM information_schema.columns "
-      "WHERE table_name = %s AND table_schema = 'public'",
-      quote_literal_cstr(base_table));
-  ret = SPI_execute(buf.data, true, 1);
-  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
-    ereport(ERROR,
-            (errmsg("could not read columns for table \"%s\"", base_table)));
-  }
-  columns =
-      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
-  new_columns =
-      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2));
-  old_columns =
-      pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3));
-
-  resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "CREATE TABLE %s.%s (LIKE public.%s INCLUDING ALL)",
-                   quote_identifier(work_schema), quote_identifier(mat_table),
-                   quote_identifier(base_table));
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR, (errmsg("failed to create materialization temp table")));
-  }
-
-  resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "INSERT INTO %s.%s SELECT * FROM %s.%s",
-                   quote_identifier(work_schema), quote_identifier(mat_table),
-                   quote_identifier(work_schema), quote_identifier(base_table));
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_INSERT) {
-    ereport(ERROR, (errmsg("failed to populate materialized copy")));
-  }
-
-  resetStringInfo(&buf);
-  appendStringInfo(&buf, "DROP VIEW %s.%s CASCADE",
-                   quote_identifier(work_schema), quote_identifier(base_table));
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR, (errmsg("failed to drop branch view")));
-  }
-
-  resetStringInfo(&buf);
-  appendStringInfo(&buf, "ALTER TABLE %s.%s RENAME TO %s",
-                   quote_identifier(work_schema), quote_identifier(mat_table),
-                   quote_identifier(base_table));
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR, (errmsg("failed to rename materialized table")));
-  }
-
-  resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "CREATE OR REPLACE FUNCTION branch.%s() RETURNS TRIGGER AS $fn$ "
-                   "BEGIN "
-                   "  IF TG_OP = 'INSERT' THEN "
-                   "    INSERT INTO branch.%s (_op, %s) VALUES ('I', %s); "
-                   "  ELSIF TG_OP = 'DELETE' THEN "
-                   "    INSERT INTO branch.%s (_op, %s) VALUES ('D', %s); "
-                   "  ELSE "
-                   "    INSERT INTO branch.%s (_op, %s) VALUES ('U', %s); "
-                   "  END IF; "
-                   "  RETURN NULL; "
-                   "END; "
-                   "$fn$ LANGUAGE plpgsql",
-                   quote_identifier(fn_name), quote_identifier(delta_table),
-                   columns, new_columns, quote_identifier(delta_table), columns,
-                   old_columns, quote_identifier(delta_table), columns,
-                   new_columns);
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR, (errmsg("failed to create AFTER trigger function")));
-  }
-
-  resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "CREATE TRIGGER _capture "
-                   "AFTER INSERT OR UPDATE OR DELETE ON %s.%s "
-                   "FOR EACH ROW EXECUTE FUNCTION branch.%s()",
-                   quote_identifier(work_schema), quote_identifier(base_table),
-                   quote_identifier(fn_name));
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_UTILITY) {
-    ereport(ERROR, (errmsg("failed to install AFTER capture trigger")));
-  }
-
-  resetStringInfo(&buf);
-  appendStringInfo(&buf,
-                   "UPDATE branch.branches SET materialized = true WHERE name = %s",
-                   quote_literal_cstr(branch_name));
-  ret = SPI_execute(buf.data, false, 0);
-  if (ret != SPI_OK_UPDATE) {
-    ereport(ERROR, (errmsg("failed to mark branch materialized")));
-  }
-
-  resetStringInfo(&buf);
-  appendStringInfo(&buf, "ANALYZE %s.%s", quote_identifier(work_schema),
-                   quote_identifier(base_table));
-  SPI_execute(buf.data, false, 0);
-
-  pfree(base_table);
-  pfree(columns);
-  pfree(new_columns);
-  pfree(old_columns);
-  pfree(delta_table);
-
-  SPI_finish();
-  elog(NOTICE, "materialized branch \"%s\"", branch_name);
+  elog(NOTICE, "rolled back all changes for branch \"%s\"", branch_name);
   PG_RETURN_VOID();
 }
 
 /* ----------------------------------------------------------------
  * branch_preview() -> SETOF RECORD
  *
- * Main: public base table. Other branches: work schema (view or table).
+ * Returns the current state of the active branch. For main, this is the
+ * base table directly. For any other branch, it is the branch's working
+ * copy (no delta overlay needed — the copy already reflects all writes).
  * ----------------------------------------------------------------
  */
 PG_FUNCTION_INFO_V1(branch_preview);
@@ -962,6 +739,114 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
     SPI_finish();
     SRF_RETURN_DONE(funcctx);
   }
+}
+
+/* ----------------------------------------------------------------
+ * branch_materialize(branch_name TEXT)
+ *
+ * Explicitly materializes an unmaterialized branch by copying the
+ * parent's current state into the working copy.  Equivalent to what
+ * the lazy trigger does on first write, but callable on demand — useful
+ * before read-heavy workloads so reads don't hit an empty working copy.
+ *
+ * No-ops if the branch is already materialized.
+ * ----------------------------------------------------------------
+ */
+PG_FUNCTION_INFO_V1(branch_materialize);
+
+Datum branch_materialize(PG_FUNCTION_ARGS) {
+  text* branch_name_t = PG_GETARG_TEXT_PP(0);
+  char* branch_name   = text_to_cstring(branch_name_t);
+
+  int          ret;
+  StringInfoData buf;
+  char*        base_table;
+  char*        parent_name;
+  char*        parent_schema;
+  char*        work_schema;
+  bool         isnull;
+  bool         already;
+
+  SPI_connect();
+
+  initStringInfo(&buf);
+  appendStringInfo(
+      &buf,
+      "SELECT b.base_table, p.name, b.materialized "
+      "FROM branch.branches b "
+      "JOIN branch.branches p ON p.branch_id = b.parent_id "
+      "WHERE b.name = %s",
+      quote_literal_cstr(branch_name));
+
+  ret = SPI_execute(buf.data, true, 1);
+  if (ret != SPI_OK_SELECT || SPI_processed == 0) {
+    ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+                    errmsg("branch \"%s\" does not exist or has no parent",
+                           branch_name)));
+  }
+
+  base_table  = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+                                     SPI_tuptable->tupdesc, 1));
+  parent_name = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+                                     SPI_tuptable->tupdesc, 2));
+  already     = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                           SPI_tuptable->tupdesc, 3, &isnull));
+
+  if (already) {
+    elog(NOTICE, "branch \"%s\" is already materialized", branch_name);
+    SPI_finish();
+    PG_RETURN_VOID();
+  }
+
+  parent_schema = (strcmp(parent_name, "main") == 0)
+                      ? pstrdup("public")
+                      : work_schema_name(parent_name);
+  work_schema   = work_schema_name(branch_name);
+
+  /* Disable capture so the bulk copy isn't logged as deltas */
+  resetStringInfo(&buf);
+  appendStringInfo(&buf, "ALTER TABLE %s.%s DISABLE TRIGGER _capture",
+                   quote_identifier(work_schema), quote_identifier(base_table));
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UTILITY) {
+    ereport(ERROR, (errmsg("failed to disable capture trigger on \"%s\"",
+                           branch_name)));
+  }
+
+  resetStringInfo(&buf);
+  appendStringInfo(&buf, "INSERT INTO %s.%s SELECT * FROM %s.%s",
+                   quote_identifier(work_schema), quote_identifier(base_table),
+                   quote_identifier(parent_schema),
+                   quote_identifier(base_table));
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_INSERT) {
+    ereport(ERROR, (errmsg("failed to materialize working copy for \"%s\"",
+                           branch_name)));
+  }
+
+  resetStringInfo(&buf);
+  appendStringInfo(&buf, "ALTER TABLE %s.%s ENABLE TRIGGER _capture",
+                   quote_identifier(work_schema), quote_identifier(base_table));
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UTILITY) {
+    ereport(ERROR, (errmsg("failed to re-enable capture trigger on \"%s\"",
+                           branch_name)));
+  }
+
+  resetStringInfo(&buf);
+  appendStringInfo(&buf,
+                   "UPDATE branch.branches SET materialized = true WHERE name = %s",
+                   quote_literal_cstr(branch_name));
+  ret = SPI_execute(buf.data, false, 0);
+  if (ret != SPI_OK_UPDATE) {
+    ereport(ERROR, (errmsg("failed to mark branch \"%s\" as materialized",
+                           branch_name)));
+  }
+
+  SPI_finish();
+
+  elog(NOTICE, "branch \"%s\" materialized", branch_name);
+  PG_RETURN_VOID();
 }
 
 /* ----------------------------------------------------------------

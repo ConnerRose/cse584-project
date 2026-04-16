@@ -79,3 +79,16 @@ creation iter 3: mvcc=0.239ms copy=17503.576ms branch=17102.632ms
     iter 2: native=331.226ms branch=357.098ms copy=362.425ms
     iter 3: native=330.549ms branch=357.692ms copy=361.411ms
 ==> q20
+    iter 1: native=6248538.373ms branch=NaNms copy=NaNms
+    iter 2: native=NaNms branch=NaNms copy=NaNms
+    iter 3: native=NaNms branch=NaNms copy=NaNms
+==> q21
+    iter 1: native=465.948ms branch=1485.311ms copy=16.218ms
+    iter 2: native=434.542ms branch=1616.842ms copy=15.176ms
+    iter 3: native=439.444ms branch=1280.651ms copy=16.100ms
+==> q22
+    iter 1: native=89.947ms branch=87.992ms copy=92.654ms
+    iter 2: native=89.733ms branch=90.429ms copy=87.493ms
+    iter 3: native=88.362ms branch=88.831ms copy=88.954ms
+/Users/abart/CS/CSE584/cse584-project/bench/tpch/run.sh: line 213: syntax error near unexpected token `('
+/Users/abart/CS/CSE584/cse584-project/bench/tpch/run.sh: line 213: `echo "Creation summary (median/stddev ms):"'
