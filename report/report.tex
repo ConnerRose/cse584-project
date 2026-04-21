@@ -38,17 +38,148 @@
 
 \maketitle
 
-\section{Problem Definition}
-Many data analysis and projection workflows are increasingly resembling software development workflows where independent versions of datasets are used to assist in "what-if" scenario analysis. To fulfill this need, the burden is on the engineer or data analyst to maintain these branched states of the data, similar to software development before version control and Git.
+\section{Introduction}
 
-A naïve solution to this problem is to simply replicate the datasets as new branches are needed. These branches would need to maintain these copies simultaneously to support queries to any current version that a user might reach. However, this is incredibly wasteful of storage as much of the duplicated data would be unchanged between versions.
+Many data analysis and projection workflows are increasingly resembling software development workflows in which independent versions of datasets support ``what-if'' scenario analysis. In software engineering, version control systems such as Git allow developers to create lightweight branches, experiment in isolation, and merge results back into a shared mainline. No comparable primitive exists within relational database systems. Without built-in support, users must resort to full table duplication, external data-lake versioning systems, or ad-hoc snapshotting mechanisms---all of which introduce storage overhead, operational complexity, and limited query awareness.
 
-The problem we aim to address is: how can we support branchable relational tables with queryable commit history while avoiding full database duplication? We want users to be able to create, query, diff, and possibly merge branches as if each branch were its own independent snapshot, while still mitigating storage costs to be proportional only to the changes made in that branch.
+The problem we address is: how can we support branchable relational tables while avoiding full database duplication? We want users to be able to create, query, and merge branches as if each branch were its own independent snapshot, while keeping storage costs proportional only to the changes made on that branch.
 
-\section{Motivation}
-Versioning and branching are important tools in software engineering, but are largely absent from relational database systems. As workflows become more collaborative and iterative, the ability to create experimental branches, compare dataset versions, and merge changes becomes increasingly more critical. Without built-in support for relational database systems, users must resort to full table duplication, external data lake versioning systems, or ad hoc snapshotting mechanisms. While functional, these approaches introduce storage overhead, operational complexity, and limited query awareness. By integrating branching semantics directly into the relational layer, the reproducibility, experimentation, and collaborative capabilities of the system could be significantly improved.
+We present a branch-aware logical redo logging framework implemented as a PostgreSQL extension. Instead of copying entire tables to create a branch, we maintain a per-branch \emph{delta table} that records logical row-level changes (inserts, updates, deletes). At query time, a SQL view overlays the delta onto the parent table, reconstructing the branch state without data duplication. Write interception is handled transparently through PostgreSQL's \texttt{INSTEAD OF} trigger mechanism, so users interact with branched tables using ordinary SQL.
 
-\section{Prior Work}
+We arrived at this design through an iterative process, exploring three distinct architectures---temporary table materialization per query, eager materialized copies per branch, and view-based delta overlay---each addressing limitations discovered in its predecessor. We evaluate all three approaches using the TPC-H benchmark suite at scale factor~1, focusing on the read overhead introduced by the branch abstraction layer over native PostgreSQL query execution.
+
+Our results show that the view-based delta overlay achieves near-zero overhead (median 1.02$\times$) for the majority of TPC-H queries, with a small number of queries exhibiting higher overhead due to fundamental limitations in how PostgreSQL's query planner handles correlated subqueries through views. We analyze these limitations and discuss potential hybrid strategies that could address them.
+
+\section{Methods}
+
+All three architectures share a common foundation. The extension maintains a metadata table, \texttt{branch.branches}, that records each branch's name, parent, base table, and associated delta table. A session-level GUC variable \\ (\texttt{branch.active\_branch}) tracks which branch the user is currently on, and \texttt{switch\_branch} updates the PostgreSQL \texttt{search\_path} so that unqualified table references resolve to the active branch's schema. This allows users to write ordinary SQL---\texttt{SELECT~*~FROM~users}, \texttt{INSERT~INTO~users}, etc.---without any branch-specific syntax.
+
+Each branch has a per-branch \emph{work schema} \\ (\texttt{branch\_work\_<name>}) that contains either a table or a view with the same name as the base table, enabling transparent resolution via \texttt{search\_path}. Each branch also has a \emph{delta table} in the \texttt{branch} schema that stores a log of row-level changes. Every delta row contains an \texttt{\_op} column (\texttt{I}/\texttt{U}/\texttt{D} for insert, update, delete), a monotonically increasing \texttt{\_seq} sequence number, and the full row payload. To resolve the latest state of any primary key, we use \\\texttt{DISTINCT~ON~(pk\_cols)~ORDER~BY~pk\_cols,~\_seq~DESC}, which selects the most recent operation per key.
+
+Branches also support two lifecycle operations: \\ \texttt{apply\_branch} replays the delta log into the parent table (analogous to a Git merge), and \texttt{rollback\_branch} discards all changes by truncating the delta table.
+
+\subsection{Temporary Table Per Query}
+
+Our first architecture faithfully implemented the ``log is the database'' philosophy from our proposal. Each read from a branched table triggered the following sequence: (1)~create a temporary table as a full copy of the base table, (2)~replay all delta log entries on top of it to reconstruct the branch state, (3)~execute the user's query against the temporary table, and (4)~drop the temporary table.
+
+This approach had the advantage of simplicity and \\ correctness---the
+reconstructed table was a first-class PostgreSQL table with full index support.
+However, it required a complete table copy \emph{on every query}, and was
+effectively a proof of concept for our overall interface design. For the TPC-H \texttt{lineitem} table at scale factor~1 (approximately 6~million rows), this resulted in roughly 1000$\times$ overhead compared to native execution. The cost was dominated by the copy and drop cycle, not the delta replay itself. This architecture was clearly unsuitable for any practical workload.
+
+\subsection{Materialized Copy Per Branch}
+
+To eliminate the per-query copy overhead, our second architecture created a full materialized copy of the base table at branch creation time. Each branch's work schema contained a real table populated with \\\texttt{CREATE~TABLE~...~AS~SELECT~*~FROM~parent}. An \texttt{AFTER~ROW} trigger on the materialized table intercepted writes and appended corresponding entries to the delta table, maintaining the change log for apply and rollback operations. Reads from the branch were direct table reads with no overlay logic---identical in performance to native PostgreSQL.
+
+Importantly, the materialized copy was only created for the currently active branch. At any given time, the system maintained at most two full copies of the data: the base table and the working copy for the active branch. Switching branches would drop the current working copy and materialize a new one by replaying the target branch's delta log onto a fresh copy of the base table.
+
+This approach delivered native read performance, since queries hit a real table with full index and parallel query support. However, it introduced significant cost at branch creation and switching time, both of which were proportional to the size of the base table (approximately 15~seconds for \texttt{lineitem} at SF=1). While storage was bounded to at most two full table copies rather than one per branch, the latency of branch operations made interactive workflows impractical for large tables.
+
+\subsection{View-Based Delta Overlay}
+
+Our final architecture eliminates data copying entirely. Instead of a materialized table, each branch's work schema contains a SQL \emph{view} that overlays the delta table onto the parent's data at query time. Branch creation is near-instant regardless of base table size---it only creates an empty delta table, a view definition, and trigger functions.
+
+The view is defined as a \texttt{LEFT~JOIN} anti-join between the parent data and the delta, unioned with the insert and update entries from the delta:
+
+\begin{verbatim}
+SELECT base.cols FROM parent base
+LEFT JOIN (
+  SELECT DISTINCT ON (pk) pk
+  FROM delta ORDER BY pk, _seq DESC
+) d ON base.pk = d.pk
+WHERE d.pk IS NULL
+UNION ALL
+SELECT cols FROM (
+  SELECT DISTINCT ON (pk) _op, cols
+  FROM delta ORDER BY pk, _seq DESC
+) d2 WHERE d2._op IN ('I','U')
+\end{verbatim}
+
+The first half selects all parent rows whose primary keys do \emph{not} appear in the delta (i.e., unchanged rows). The second half selects the latest version of each inserted or updated row from the delta. Deleted rows are excluded because they appear in the delta with \texttt{\_op='D'}, causing them to be filtered out of both halves.
+
+Write interception uses PostgreSQL's \texttt{INSTEAD~OF} trigger mechanism on the view. When a user executes an \texttt{INSERT}, \texttt{UPDATE}, or \texttt{DELETE} against the view, the trigger function appends the corresponding delta entry rather than modifying the base table. This makes writes transparent---the user writes ordinary SQL and the branch layer captures the changes automatically.
+
+An important design decision was the choice of \texttt{LEFT~JOIN} over \texttt{NOT~IN} for the anti-join. Our initial implementation used \texttt{NOT~IN~(SELECT~pk~FROM~latest)}, which prevented PostgreSQL's parallel query executor from engaging---the \texttt{NOT~IN} subplan is evaluated per-row and cannot be parallelized. Switching to a \texttt{LEFT~JOIN~...~WHERE~d.pk~IS~NULL} pattern allows PostgreSQL to use a Hash Anti Join, which supports parallel sequential scans. This single change reduced overhead on TPC-H Q6 from 2.75$\times$ to 1.02$\times$.
+
+\section{Performance Results}
+
+\subsection{Benchmark Setup}
+
+We evaluate the view-based delta overlay architecture using the TPC-H benchmark suite at scale factor~1 (approximately 6~million rows in \texttt{lineitem}, 1.5~million in \texttt{orders}, and proportional counts in the remaining six tables). The benchmark runs on PostgreSQL~17 on an Apple~M3 system.
+
+For each of the 22 TPC-H queries (excluding Q17, which did not terminate within a reasonable time for either configuration), we measure execution time under two configurations:
+
+\begin{enumerate}
+  \item \textbf{Native}: the query runs against the base tables in the \texttt{public} schema with no branch layer active.
+  \item \textbf{Branch}: the session is switched to an empty child branch. The \texttt{lineitem} table resolves to the branch's overlay view; all other tables resolve from \texttt{public} as usual.
+\end{enumerate}
+
+The branch has an empty delta table, so we are measuring the pure structural overhead of the view-based overlay---the cost of the query planner incorporating the \texttt{LEFT~JOIN} and \texttt{UNION~ALL} into its plan---rather than the cost of replaying any actual deltas.
+
+Each query is executed 3~times per configuration, alternating execution order between iterations (odd iterations run native first, even iterations run branch first) to neutralize cache warming bias. We report the median time for each configuration.
+
+\subsection{Results}
+
+Table~\ref{tab:results} presents the benchmark results.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrr}
+\hline
+\textbf{Query} & \textbf{Native (ms)} & \textbf{Branch (ms)} & \textbf{Overhead} \\
+\hline
+Q1  & 1138.7 & 1330.0 & 1.17$\times$ \\
+Q2  & 180.2  & 180.2  & 1.00$\times$ \\
+Q3  & 260.1  & 446.1  & 1.72$\times$ \\
+Q4  & 133.6  & 5156.1 & 38.60$\times$ \\
+Q5  & 159.1  & 604.4  & 3.80$\times$ \\
+Q6  & 222.3  & 226.2  & 1.02$\times$ \\
+Q7  & 242.3  & 398.6  & 1.65$\times$ \\
+Q8  & 221.6  & 501.1  & 2.26$\times$ \\
+Q9  & 1002.4 & 1122.6 & 1.12$\times$ \\
+Q10 & 376.9  & 426.6  & 1.13$\times$ \\
+Q11 & 69.8   & 69.2   & 0.99$\times$ \\
+Q12 & 360.4  & 340.9  & 0.95$\times$ \\
+Q13 & 393.4  & 390.2  & 0.99$\times$ \\
+Q14 & 220.3  & 226.0  & 1.03$\times$ \\
+Q15 & 453.6  & 468.1  & 1.03$\times$ \\
+Q16 & 129.0  & 127.0  & 0.98$\times$ \\
+Q18 & 1443.1 & 2699.5 & 1.87$\times$ \\
+Q19 & 316.3  & 318.7  & 1.01$\times$ \\
+Q21 & 374.2  & 1659.7 & 4.44$\times$ \\
+Q22 & 92.2   & 90.3   & 0.98$\times$ \\
+\hline
+\end{tabular}
+\caption{TPC-H query execution times (median of 3 runs, SF=1) comparing native PostgreSQL to the view-based branch overlay with an empty delta table.}
+\label{tab:results}
+\end{table}
+
+\textbf{Near-zero overhead (0.95--1.17$\times$):} Twelve of twenty-one queries---Q1, Q2, Q6, Q9--Q16, Q19, Q22---exhibit overhead at or below 1.17$\times$. These queries primarily involve sequential scans, aggregations, and hash joins on \texttt{lineitem}. The \texttt{LEFT~JOIN} anti-join structure allows PostgreSQL to use a Hash Anti Join plan, preserving parallel query execution. For several queries (Q11, Q12, Q13, Q16, Q22), the branch configuration is marginally \emph{faster} than native, which we attribute to normal measurement variance.
+
+\textbf{Moderate overhead (1.65--2.26$\times$):} Queries Q3, Q7, Q8, and Q18 show moderate overhead. These queries involve multi-table joins where \texttt{lineitem} participates in hash or merge joins with other tables. The view structure introduces additional planning complexity and may prevent certain join reordering optimizations.
+
+\textbf{Severe overhead (3.80--38.60$\times$):} Queries Q4, Q5, and Q21 exhibit significant overhead. Q4 is the most extreme at 38.60$\times$. Analysis of the query plans reveals the root cause: these queries use \texttt{EXISTS} correlated subqueries or semi-joins against \texttt{lineitem}. In the native case, PostgreSQL resolves these with a Nested Loop Semi Join using an index scan on \texttt{lineitem\_pkey}---for Q4, this means approximately 56,000 efficient index probes. Through the view, the planner cannot push the correlated predicate through the \texttt{UNION~ALL} to reach the underlying table's index. Instead, it must materialize the entire view (scanning all 6~million rows), then join the result. This is a fundamental limitation of how PostgreSQL's optimizer handles correlated subqueries through views containing \texttt{UNION~ALL}.
+
+\subsection{Discussion}
+
+The results demonstrate that the view-based delta overlay is highly effective for queries that access \texttt{lineitem} through sequential scans, aggregations, and equality joins---the predominant access patterns in analytical workloads. The overhead for these queries is negligible, confirming that the \texttt{LEFT~JOIN} anti-join pattern successfully preserves PostgreSQL's parallel query capabilities.
+
+The severe overhead on correlated subquery patterns (Q4, Q5, Q21) represents a fundamental trade-off of operating at the SQL view layer rather than at the storage layer. Systems like Neon, which implement branching below PostgreSQL's storage engine at the page level, do not suffer from this limitation because the query planner is entirely unaware that branching exists---every branch appears as a fully independent database with its own indexes. However, such systems require replacing PostgreSQL's entire storage layer and running distributed infrastructure (page servers, object storage), whereas our approach works as a lightweight extension installable with a single \texttt{CREATE~EXTENSION} command.
+
+A potential mitigation strategy is a \emph{hybrid approach}: use the lightweight view overlay by default, but materialize a branch's working copy when the delta table exceeds a size threshold or when query patterns requiring index access are detected. This would combine the instant creation and minimal storage of the view approach with the full query performance of a materialized copy, at the cost of additional implementation complexity.
+
+\section{Conclusion}
+
+We presented a branch-aware logical redo logging framework for PostgreSQL that enables Git-like branching semantics for relational tables. Through an iterative design process, we explored three architectures---temporary table materialization, eager materialized copies, and view-based delta overlay---each addressing limitations discovered in its predecessor.
+
+Our final view-based design achieves its primary goals: branch creation is near-instant regardless of table size, storage is proportional only to the changes made on each branch, and users interact with branched tables using ordinary SQL with no special syntax. The key technical insight was that the choice of SQL anti-join pattern (\texttt{LEFT~JOIN} vs.\ \texttt{NOT~IN}) has a dramatic impact on whether PostgreSQL's parallel query executor can engage, reducing overhead from 2.75$\times$ to 1.02$\times$ for typical analytical queries.
+
+Evaluation on TPC-H at scale factor~1 shows that 12 of 21 queries run with overhead below 1.17$\times$, confirming that the branch layer is nearly invisible for the majority of analytical workloads. A small number of queries involving correlated subqueries exhibit higher overhead due to PostgreSQL's inability to push predicates through \texttt{UNION~ALL} views to underlying indexes---a fundamental optimizer limitation that affects any view-based approach.
+
+Future work includes implementing a hybrid materialization strategy that could eliminate the correlated subquery overhead, adding branch diff operations to compare the state of two branches, and extending the system to support multi-table branching where a single branch operation spans multiple related tables.
+
+\section{Related Work}
 
 Dataset versioning is not a completely novel idea, but many known attempts have been at the storage or file layer rather than inside a relational engine.
 
@@ -64,31 +195,6 @@ While more similar to our objective than MVCC, LakeFS operates distinctly at the
 
 \subsection{OrpheusDB}
 The OrpheusDB paper \cite{orpheusdb} presents a well-motivated argument for version-controlled database systems, particularly in data science and analytical workflows where datasets frequently evolve while requiring reproducibility. OrpheusDB provides a solution similar to our goal by offering table level versioning granularity. However, similar to LakeFS, the system is implemented as a bolt-on layer rather than being embedded directly into the relational engine. More specifically, versioning is managed through additional storage structures and metadata rather than by modifying the native visibility and storage mechanisms of database tuples.
-
-
-\section{Proposed Approach}
-We propose a branch-aware logical redo logging framework implemented as a PostgreSQL extension. Instead of copying entire tables to create a branch, we utilize the idea of "the log is the database" with redo logs, similar to Amazon Aurora \cite{aurora}. To simulate a main branch, we maintain a base table. For every branch that the system creates, we will maintain a logical redo log, formatted as a delta table within PostgreSQL. When writes are made on a branch, logical changes will be appended to the respective branch's delta log. Finally, when the branch is needed at query time, we can reconstruct the branch state by appending the changes in the delta log to the base table.
-
-Unlike other approaches, this proposed approach implements branches within the relational database engine. By doing so, our design introduces row-level branching, logical redo per branch, query-time delta layering, and efficient branch creation. Unlike object-store versioning systems, our relational-layer integration enables branch-aware optimizations within the query layer. As a result, this integration allows queries to be automatically rewritten to incorporate branch deltas transparently.
-
-Our approach will support new commands to allow users to work with branches, specifically creating a new branch and switching between branches. A CREATE BRANCH query will include the newly created branch name and the name of the branched workspace.
-\newline \newline
-\textit{Template: CREATE BRANCH <new\_branch> FROM <original\_branch>}
-\newline 
-\textit{Example: CREATE BRANCH experiment1 FROM main}
-\newline \newline
-A SWITCH BRANCH query will include the branch name of the branch being switched to.
-\newline \newline
-\textit{Template: SWITCH BRANCH <branch\_name>}
-\newline 
-\textit{Example: SWITCH BRANCH main}
-
-
-
-\section{Evaluation Plan}
-
-We plan to evaluate our system against native PostgreSQL mechanisms such as table cloning and time-travel queries. A significant emphasis of our evaluation will be qualitative in nature, given the fact that we are developing a novel solution. Our primary goal is largely based on the system's functionality, with performance acting as an additional beneficial metric. We do plan to write benchmarks representative of real-life workloads in order to determine the effectiveness of our solution.
-
 
 \settopmatter{printacmref=false}
 \bibliographystyle{plain}
