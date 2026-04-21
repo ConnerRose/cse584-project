@@ -1,0 +1,104 @@
+\documentclass[sigplan, nonacm]{acmart}
+
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    Bib\TeX}}}
+
+\usepackage{graphicx}
+\graphicspath{ {./images/} }
+
+\begin{document}
+
+\settopmatter{printacmref=false}
+\setcopyright{none}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+
+\title{Branch-Aware Logical Redo Logging for Relational Databases}
+
+\author{Derek Yang}
+\affiliation{%
+  \institution{University of Michigan}
+  \city{Ann Arbor}
+  \country{USA}}
+\email{dereky@umich.edu}
+
+\author{Alex Bartolozzi}
+\affiliation{%
+  \institution{University of Michigan}
+  \city{Ann Arbor}
+  \country{USA}}
+\email{alexbart@umich.edu}
+
+\author{Conner Rose}
+\affiliation{%
+  \institution{University of Michigan}
+  \city{Ann Arbor}
+  \country{USA}}
+\email{cnrose@umich.edu}
+
+\maketitle
+
+\section{Problem Definition}
+Many data analysis and projection workflows are increasingly resembling software development workflows where independent versions of datasets are used to assist in "what-if" scenario analysis. To fulfill this need, the burden is on the engineer or data analyst to maintain these branched states of the data, similar to software development before version control and Git.
+
+A naïve solution to this problem is to simply replicate the datasets as new branches are needed. These branches would need to maintain these copies simultaneously to support queries to any current version that a user might reach. However, this is incredibly wasteful of storage as much of the duplicated data would be unchanged between versions.
+
+The problem we aim to address is: how can we support branchable relational tables with queryable commit history while avoiding full database duplication? We want users to be able to create, query, diff, and possibly merge branches as if each branch were its own independent snapshot, while still mitigating storage costs to be proportional only to the changes made in that branch.
+
+\section{Motivation}
+Versioning and branching are important tools in software engineering, but are largely absent from relational database systems. As workflows become more collaborative and iterative, the ability to create experimental branches, compare dataset versions, and merge changes becomes increasingly more critical. Without built-in support for relational database systems, users must resort to full table duplication, external data lake versioning systems, or ad hoc snapshotting mechanisms. While functional, these approaches introduce storage overhead, operational complexity, and limited query awareness. By integrating branching semantics directly into the relational layer, the reproducibility, experimentation, and collaborative capabilities of the system could be significantly improved.
+
+\section{Prior Work}
+
+Dataset versioning is not a completely novel idea, but many known attempts have been at the storage or file layer rather than inside a relational engine.
+
+\subsection{MVCC}
+A semi-related problem that has been solved in the past is the challenge with concurrent updates to a row from user A and user B. Incorrect handling of this scenario can result in user B reading stale or only partially updated data. The solution proposed by MVCC \cite{ssi} is to provide each user with their own isolated snapshot of the database at the given time of a transaction to preserve state across multiple users and link them together. This is a form of branching as multiple versions of a row are maintained, but this solution is only relevant for short term changes that interfere with concurrency.
+
+MVCC therefore provides the primitives for multi-version storage, but does not go as far as to allow for persistent, long-term branching.
+
+\subsection{LakeFS}
+Data lake systems such as LakeFS \cite{lakefs} provide Git-like branching and snapshot semantics for large collections of files in object storage. LakeFS employs a copy-on-write model that maintains metadata to map snapshots to shared underlying files which prevents redundant duplication.
+
+While more similar to our objective than MVCC, LakeFS operates distinctly at the file level; therefore, the system is incapable of versioning at the granularity of an individual tuple. Additionally, LakeFS operates outside the relational query engine, differing from our goal of embedding branching directly inside a relational engine.
+
+\subsection{OrpheusDB}
+The OrpheusDB paper \cite{orpheusdb} presents a well-motivated argument for version-controlled database systems, particularly in data science and analytical workflows where datasets frequently evolve while requiring reproducibility. OrpheusDB provides a solution similar to our goal by offering table level versioning granularity. However, similar to LakeFS, the system is implemented as a bolt-on layer rather than being embedded directly into the relational engine. More specifically, versioning is managed through additional storage structures and metadata rather than by modifying the native visibility and storage mechanisms of database tuples.
+
+
+\section{Proposed Approach}
+We propose a branch-aware logical redo logging framework implemented as a PostgreSQL extension. Instead of copying entire tables to create a branch, we utilize the idea of "the log is the database" with redo logs, similar to Amazon Aurora \cite{aurora}. To simulate a main branch, we maintain a base table. For every branch that the system creates, we will maintain a logical redo log, formatted as a delta table within PostgreSQL. When writes are made on a branch, logical changes will be appended to the respective branch's delta log. Finally, when the branch is needed at query time, we can reconstruct the branch state by appending the changes in the delta log to the base table.
+
+Unlike other approaches, this proposed approach implements branches within the relational database engine. By doing so, our design introduces row-level branching, logical redo per branch, query-time delta layering, and efficient branch creation. Unlike object-store versioning systems, our relational-layer integration enables branch-aware optimizations within the query layer. As a result, this integration allows queries to be automatically rewritten to incorporate branch deltas transparently.
+
+Our approach will support new commands to allow users to work with branches, specifically creating a new branch and switching between branches. A CREATE BRANCH query will include the newly created branch name and the name of the branched workspace.
+\newline \newline
+\textit{Template: CREATE BRANCH <new\_branch> FROM <original\_branch>}
+\newline 
+\textit{Example: CREATE BRANCH experiment1 FROM main}
+\newline \newline
+A SWITCH BRANCH query will include the branch name of the branch being switched to.
+\newline \newline
+\textit{Template: SWITCH BRANCH <branch\_name>}
+\newline 
+\textit{Example: SWITCH BRANCH main}
+
+
+
+\section{Evaluation Plan}
+
+We plan to evaluate our system against native PostgreSQL mechanisms such as table cloning and time-travel queries. A significant emphasis of our evaluation will be qualitative in nature, given the fact that we are developing a novel solution. Our primary goal is largely based on the system's functionality, with performance acting as an additional beneficial metric. We do plan to write benchmarks representative of real-life workloads in order to determine the effectiveness of our solution.
+
+
+\settopmatter{printacmref=false}
+\bibliographystyle{plain}
+\bibliography{references}
+
+\pagestyle{plain}
+
+
+\end{document}
+
+\endinput
+%%
+%% End of file `sample-sigplan.tex'.
