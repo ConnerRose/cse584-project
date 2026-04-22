@@ -10,35 +10,24 @@
 
 PG_MODULE_MAGIC;
 
-/* GUC variable: the currently active branch name */
 static char* active_branch = NULL;
 
 void _PG_init(void) {
   DefineCustomStringVariable("branch.active_branch",
                              "The currently active branch name.", NULL,
-                             &active_branch, "main", /* default value */
-                             PGC_USERSET, /* any user can set it per-session */
-                             0,           /* flags */
-                             NULL,        /* check_hook */
-                             NULL,        /* assign_hook */
-                             NULL         /* show_hook */
-  );
+                             &active_branch, "main",
+                             PGC_USERSET, 0, NULL, NULL, NULL);
 }
 
-/* Return the work schema name for a branch: "branch_work_<name>". */
 static char* work_schema_name(const char* branch_name) {
   return psprintf("branch_work_%s", branch_name);
 }
 
-/* Return the trigger function name for a branch: "_cow_<name>". */
 static char* trigger_fn_name(const char* branch_name) {
   return psprintf("_cow_%s", branch_name);
 }
 
-/*
- * Look up a branch's base_table by name. Returns a palloc'd string.
- * Must be called within an active SPI connection.
- */
+/* Look up a branch's base_table by name. Must be called within SPI. */
 static char* lookup_base_table(const char* branch_name) {
   StringInfoData buf;
   int ret;
@@ -61,23 +50,8 @@ static char* lookup_base_table(const char* branch_name) {
   return result;
 }
 
-/* ----------------------------------------------------------------
- * branch_create(new_branch TEXT, from_branch TEXT)
- *
- * Creates a new branch using copy-on-write semantics:
- *   1. Creates a per-branch "work schema" (branch_work_<name>)
- *   2. Creates an empty delta table for the redo log
- *   3. Creates a VIEW in the work schema that overlays the delta
- *      table onto the parent's data (base table or parent view).
- *      With an empty delta, the view resolves to the parent as-is.
- *   4. Installs INSTEAD OF triggers on the view to intercept writes
- *      and append them to the delta table.
- *   5. Registers the branch in branch.branches
- *
- * No data is copied — branch creation is near-instant regardless
- * of base table size.
- * ----------------------------------------------------------------
- */
+/* Creates a new branch: work schema, empty delta table, overlay view,
+ * INSTEAD OF triggers, and metadata registration. No data is copied. */
 PG_FUNCTION_INFO_V1(branch_create);
 
 Datum branch_create(PG_FUNCTION_ARGS) {
@@ -91,7 +65,7 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   int parent_id;
   bool isnull;
   char* base_table;
-  char* parent_source; /* schema-qualified parent table/view */
+  char* parent_source;
   char* work_schema;
   char* delta_table;
   char* fn_name;
@@ -99,13 +73,12 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   char* new_columns;
   char* old_columns;
   char* pk_cols;
-  char* pk_join_cond;  /* e.g. "base.id = d.id AND base.x = d.x" */
-  char* pk_first_col;  /* e.g. "id" — for IS NULL check */
-  char* base_columns;  /* e.g. "base.id, base.name" */
+  char* pk_join_cond;
+  char* pk_first_col;
+  char* base_columns;
 
   SPI_connect();
 
-  /* Look up the parent branch */
   initStringInfo(&buf);
   appendStringInfo(
       &buf, "SELECT branch_id, base_table FROM branch.branches WHERE name = %s",
@@ -122,7 +95,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   base_table =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2));
 
-  /* Parent's data source: public.<table> for main, else parent's view */
   if (strcmp(from_branch, "main") == 0) {
     parent_source = psprintf("public.%s", quote_identifier(base_table));
   } else {
@@ -135,7 +107,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   delta_table = psprintf("branch_delta_%s", new_branch);
   fn_name = trigger_fn_name(new_branch);
 
-  /* 1. Create the work schema */
   resetStringInfo(&buf);
   appendStringInfo(&buf, "CREATE SCHEMA %s", quote_identifier(work_schema));
   ret = SPI_execute(buf.data, false, 0);
@@ -144,7 +115,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
             (errmsg("failed to create work schema \"%s\"", work_schema)));
   }
 
-  /* 2. Create the delta table */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "CREATE TABLE branch.%s ("
@@ -159,7 +129,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
                            new_branch)));
   }
 
-  /* Get column lists and PK for the view + trigger */
   resetStringInfo(&buf);
   appendStringInfo(
       &buf,
@@ -190,7 +159,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   base_columns =
       pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4));
 
-  /* Get PK columns and join condition */
   resetStringInfo(&buf);
   appendStringInfo(
       &buf,
@@ -224,7 +192,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
     pk_first_col = pstrdup(first_val);
   }
 
-  /* 3. Create the overlay view (LEFT JOIN anti-join for parallelism) */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "CREATE VIEW %s.%s AS "
@@ -241,15 +208,10 @@ Datum branch_create(PG_FUNCTION_ARGS) {
                    "  FROM branch.%s "
                    "  ORDER BY %s, _seq DESC"
                    ") d2 WHERE d2._op IN ('I','U')",
-                   /* CREATE VIEW <schema>.<table> AS */
                    quote_identifier(work_schema), quote_identifier(base_table),
-                   /* SELECT <base.cols> FROM <parent> base */
                    base_columns, parent_source,
-                   /* LEFT JOIN (SELECT DISTINCT ON (<pk>) <pk> FROM <delta> ORDER BY <pk>, _seq DESC) d */
                    pk_cols, pk_cols, quote_identifier(delta_table), pk_cols,
-                   /* ON <join_cond> WHERE d.<first_pk> IS NULL */
                    pk_join_cond, pk_first_col,
-                   /* UNION ALL SELECT <cols> FROM (SELECT DISTINCT ON (<pk>) ... FROM <delta>) d2 WHERE ... */
                    columns,
                    pk_cols, columns, quote_identifier(delta_table), pk_cols);
   ret = SPI_execute(buf.data, false, 0);
@@ -259,7 +221,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
                     new_branch)));
   }
 
-  /* 4a. Create the per-branch INSTEAD OF trigger function */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "CREATE FUNCTION branch.%s() RETURNS TRIGGER AS $fn$ "
@@ -287,7 +248,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
                            new_branch)));
   }
 
-  /* 4b. Install INSTEAD OF triggers on the view */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "CREATE TRIGGER _cow "
@@ -301,7 +261,6 @@ Datum branch_create(PG_FUNCTION_ARGS) {
                            work_schema, base_table)));
   }
 
-  /* 5. Register the branch */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "INSERT INTO branch.branches (name, parent_id, "
@@ -321,13 +280,7 @@ Datum branch_create(PG_FUNCTION_ARGS) {
   PG_RETURN_VOID();
 }
 
-/* ----------------------------------------------------------------
- * branch_switch(target_branch TEXT)
- *
- * Sets the session GUC branch.active_branch and updates search_path
- * so table references resolve to the branch's overlay view.
- * ----------------------------------------------------------------
- */
+/* Sets the active branch GUC and search_path for the session. */
 PG_FUNCTION_INFO_V1(branch_switch);
 
 Datum branch_switch(PG_FUNCTION_ARGS) {
@@ -339,7 +292,6 @@ Datum branch_switch(PG_FUNCTION_ARGS) {
 
   SPI_connect();
 
-  /* Verify the branch exists */
   initStringInfo(&buf);
   appendStringInfo(&buf, "SELECT 1 FROM branch.branches WHERE name = %s",
                    quote_literal_cstr(target));
@@ -352,7 +304,6 @@ Datum branch_switch(PG_FUNCTION_ARGS) {
 
   SPI_finish();
 
-  /* Set the GUC and search_path */
   SetConfigOption("branch.active_branch", target, PGC_USERSET, PGC_S_SESSION);
 
   if (strcmp(target, "main") == 0) {
@@ -367,13 +318,7 @@ Datum branch_switch(PG_FUNCTION_ARGS) {
   PG_RETURN_VOID();
 }
 
-/* ----------------------------------------------------------------
- * branch_apply(branch_name TEXT)
- *
- * Replays the branch's delta log into the base table, applying the
- * latest op per primary key, then truncates the delta table.
- * ----------------------------------------------------------------
- */
+/* Replays the branch's delta log into the base table, then truncates it. */
 PG_FUNCTION_INFO_V1(branch_apply);
 
 Datum branch_apply(PG_FUNCTION_ARGS) {
@@ -387,7 +332,6 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
 
   SPI_connect();
 
-  /* Look up branch metadata */
   initStringInfo(&buf);
   appendStringInfo(
       &buf,
@@ -410,7 +354,6 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
   }
   delta_table = pstrdup(delta_table);
 
-  /* Get column names */
   resetStringInfo(&buf);
   appendStringInfo(&buf,
                    "SELECT string_agg(quote_ident(column_name), ', ' "
@@ -429,7 +372,6 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
     char* columns =
         pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 
-    /* Get PK columns */
     resetStringInfo(&buf);
     appendStringInfo(
         &buf,
@@ -455,7 +397,6 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
         ereport(ERROR, (errmsg("table \"%s\" has no primary key", base_table)));
       }
 
-      /* Materialize the latest delta per PK into a temp table */
       resetStringInfo(&buf);
       appendStringInfo(&buf,
                        "CREATE TEMP TABLE _branch_apply_latest AS "
@@ -468,7 +409,6 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
         ereport(ERROR, (errmsg("failed to materialize latest deltas")));
       }
 
-      /* Apply inserts */
       resetStringInfo(&buf);
       appendStringInfo(&buf,
                        "INSERT INTO public.%s (%s) "
@@ -480,7 +420,6 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
                                branch_name)));
       }
 
-      /* Apply deletes */
       resetStringInfo(&buf);
       appendStringInfo(&buf,
                        "DELETE FROM public.%s WHERE (%s) IN "
@@ -492,7 +431,6 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
                                branch_name)));
       }
 
-      /* Apply updates: delete old rows then insert updated rows */
       resetStringInfo(&buf);
       appendStringInfo(&buf,
                        "DELETE FROM public.%s WHERE (%s) IN "
@@ -521,7 +459,6 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
     }
   }
 
-  /* Truncate the delta table */
   resetStringInfo(&buf);
   appendStringInfo(&buf, "TRUNCATE branch.%s", quote_identifier(delta_table));
   ret = SPI_execute(buf.data, false, 0);
@@ -536,14 +473,7 @@ Datum branch_apply(PG_FUNCTION_ARGS) {
   PG_RETURN_VOID();
 }
 
-/* ----------------------------------------------------------------
- * branch_rollback(branch_name TEXT)
- *
- * Discards all changes on the branch by truncating its delta table.
- * The overlay view automatically reflects the parent's state again
- * since there are no deltas to overlay.
- * ----------------------------------------------------------------
- */
+/* Discards all branch changes by truncating the delta table. */
 PG_FUNCTION_INFO_V1(branch_rollback);
 
 Datum branch_rollback(PG_FUNCTION_ARGS) {
@@ -556,7 +486,6 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
 
   SPI_connect();
 
-  /* Look up the delta table */
   initStringInfo(&buf);
   appendStringInfo(&buf,
                    "SELECT delta_table FROM branch.branches WHERE name = %s",
@@ -575,7 +504,6 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
                            branch_name)));
   }
 
-  /* Truncate the delta table — view instantly reflects parent state */
   resetStringInfo(&buf);
   appendStringInfo(&buf, "TRUNCATE branch.%s", quote_identifier(delta_table));
   ret = SPI_execute(buf.data, false, 0);
@@ -590,14 +518,7 @@ Datum branch_rollback(PG_FUNCTION_ARGS) {
   PG_RETURN_VOID();
 }
 
-/* ----------------------------------------------------------------
- * branch_preview() -> SETOF RECORD
- *
- * Returns the current state of the active branch. For main, reads
- * the base table directly. For other branches, reads through the
- * overlay view (which handles delta resolution automatically).
- * ----------------------------------------------------------------
- */
+/* Returns the current branch state as a set of records. */
 PG_FUNCTION_INFO_V1(branch_preview);
 
 Datum branch_preview(PG_FUNCTION_ARGS) {
@@ -679,12 +600,7 @@ Datum branch_preview(PG_FUNCTION_ARGS) {
   }
 }
 
-/* ----------------------------------------------------------------
- * branch_current() -> TEXT
- *
- * Returns the name of the currently active branch.
- * ----------------------------------------------------------------
- */
+/* Returns the name of the currently active branch. */
 PG_FUNCTION_INFO_V1(branch_current);
 
 Datum branch_current(PG_FUNCTION_ARGS) {
